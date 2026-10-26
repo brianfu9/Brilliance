@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <atomic>
 #include <ctime>
 #include <random>
 
@@ -809,7 +810,7 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     const bool flatten = r.format == "jpeg" || r.background == "opaque";
     const std::string fmt = r.format;
     const int32_t comp = r.compression;
-    auto encode = [fmt, comp, keep_px, src_px, flatten](gen::Image& im, std::string* b64,
+    auto encode = [this, fmt, comp, keep_px, src_px, flatten](gen::Image& im, std::string* b64,
                                                         std::string* why) -> int {
         std::vector<uint8_t>& px = im.px;
         const size_t ch = (size_t)im.ch;
@@ -828,6 +829,14 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
         if (s < 0) return s;
         *b64 = base64_encode(file.data(), file.size());
+        if (!opt_.media_out.empty() && !im.preview) {
+            static std::atomic<uint64_t> n{0};
+            const std::string name =
+                std::to_string((int64_t)std::time(nullptr)) + "-" + std::to_string(im.index) +
+                "-seed" + std::to_string(im.seed) + "-" + std::to_string(n.fetch_add(1)) +
+                "." + fmt;
+            persist_media_file("images", name, file.data(), file.size());
+        }
         return RAD_OK;
     };
     const std::string bg_out = flatten ? "opaque" : "transparent";

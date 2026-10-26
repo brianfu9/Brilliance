@@ -1131,6 +1131,8 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         j->completed_at = now;
         j->expires_at = now + opt_.video_ttl_s;
         j->mp4 = std::move(file);
+        if (!opt_.media_out.empty())
+            persist_media_file("videos", j->id + ".mp4", j->mp4.data(), j->mp4.size());
         auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1e9; };
         const std::string steps = t.t_upscaled_ns > 0
             ? rad::fmt("small steps %.1f s, upscale %.2f s, full steps %.1f s",

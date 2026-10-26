@@ -114,6 +114,11 @@ struct ServerOptions {
      * many finished videos are kept at most (the oldest go first). */
     int64_t     video_ttl_s = 3600;
     int64_t     max_videos = 32;
+    /* If set, a directory where finished videos (videos/) and generated images (images/) are
+     * saved; both subdirectories are created at startup. Saving is best effort: the response
+     * is already decided when it happens, so a failure only logs. The finished video's
+     * in-memory job is kept for video_ttl_s seconds regardless of this. */
+    std::string media_out;
     /* A shape generator (rad_declare_shape_generator) generates no text either: the text
      * endpoints answer 501 naming /generate. A shape made through /send is kept for /status for
      * as long as a video, as many at most. */
@@ -408,6 +413,9 @@ private:
     void sweep_videos_locked(int64_t now);
     /* Cancels every job and joins its thread; at stop(). */
     void stop_videos();
+    /* A finished video or a generated image to <media_out>/<sub>/<name>. */
+    void persist_media_file(const std::string& sub, const std::string& name,
+                            const void* data, size_t len);
     static json video_json(const VideoJob& j);
     /* A finished or running job's file: *res, or false with *err. */
     static bool video_content(const VideoJob& j, const HttpRequest& req, HttpResponse* res, ApiError* err);

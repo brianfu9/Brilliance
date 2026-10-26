@@ -1,7 +1,10 @@
 #include "server.h"
 #include "server_priv.h"
 
+#include <cerrno>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include "clef.h"
 #include "laya.h"
 #include "mica.h"
@@ -56,6 +59,20 @@ Server::Server(const Deps& d, const ServerOptions& o)
     odeps_.mm = deps_.mm;
     odeps_.embed = deps_.embed;
 
+    if (!opt_.media_out.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(opt_.media_out, ec);
+        std::filesystem::create_directories(opt_.media_out + "/images", ec);
+        std::filesystem::create_directories(opt_.media_out + "/videos", ec);
+        if (ec) {
+            RAD_WARN("media out: %s: %s; persistence is off", opt_.media_out.c_str(),
+                     ec.message().c_str());
+            opt_.media_out.clear();
+        } else {
+            RAD_INFO("media out: finished videos and generated images persist under %s",
+                     opt_.media_out.c_str());
+        }
+    }
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
     register_routes();
@@ -68,6 +85,18 @@ bool Server::local_operator(const HttpRequest& req) const {
 }
 
 Server::~Server() { stop(); }
+
+/* A finished video or a generated image to <media_out>/<sub>/<name>. A best effort copy:
+ * the response is already decided when it happens, so a failure only logs. */
+void Server::persist_media_file(const std::string& sub, const std::string& name,
+                                const void* data, size_t len) {
+    const std::string path = opt_.media_out + "/" + sub + "/" + name;
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { RAD_WARN("media out: %s: %s", path.c_str(), strerror(errno)); return; }
+    f.write((const char*)data, (std::streamsize)len);
+    if (!f) { RAD_WARN("media out: %s: short write", path.c_str()); return; }
+    RAD_INFO("media out: saved %s (%.1f MB)", path.c_str(), (double)len / 1e6);
+}
 
 /* A sink may be freed only after the scheduler reports its request terminal, since
  * `Request::sink` is a raw pointer the scheduler holds for the request's life. At shutdown this

@@ -3878,6 +3878,11 @@ int Engine::run_server() {
         o.prefix_cache_mib = cfg_.prefix_cache_mib;
     }
     o.model_path = cfg_.model;
+    if (const char* mo = std::getenv("RADIANCE_MEDIA_OUT")) {
+        o.media_out = mo;
+        if (!o.media_out.empty())
+            decide("--media-out", o.media_out, "environment (RADIANCE_MEDIA_OUT)");
+    }
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;

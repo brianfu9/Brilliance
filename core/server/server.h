@@ -413,9 +413,11 @@ private:
     void sweep_videos_locked(int64_t now);
     /* Cancels every job and joins its thread; at stop(). */
     void stop_videos();
-    /* A finished video or a generated image to <media_out>/<sub>/<name>. */
+    /* A finished video or a generated image to <media_out>/<sub>/<index>-<name>. */
     void persist_media_file(const std::string& sub, const std::string& name,
                             const void* data, size_t len);
+    /* The next index of the sequence images and videos share (<media_out>/.index); 0 if unusable. */
+    uint64_t next_media_index();
     static json video_json(const VideoJob& j);
     /* A finished or running job's file: *res, or false with *err. */
     static bool video_content(const VideoJob& j, const HttpRequest& req, HttpResponse* res, ApiError* err);

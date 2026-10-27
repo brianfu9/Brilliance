@@ -3,8 +3,17 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <fcntl.h>
+#if defined(_WIN32)
+#include "os/os.h"   /* Brilliance: os::flock_fd -- Windows has no <sys/file.h> */
+#else
+#include <sys/file.h>
+#endif
+#include <unistd.h>
 #include "clef.h"
 #include "laya.h"
 #include "mica.h"
@@ -60,6 +69,10 @@ Server::Server(const Deps& d, const ServerOptions& o)
     odeps_.embed = deps_.embed;
 
     if (!opt_.media_out.empty()) {
+        while (opt_.media_out.size() > 1 &&
+               (opt_.media_out.back() == '/' || opt_.media_out.back() == '\\') &&
+               !(opt_.media_out.size() == 3 && opt_.media_out[1] == ':'))
+            opt_.media_out.pop_back();
         std::error_code ec;
         std::filesystem::create_directories(opt_.media_out, ec);
         std::filesystem::create_directories(opt_.media_out + "/images", ec);
@@ -86,11 +99,85 @@ bool Server::local_operator(const HttpRequest& req) const {
 
 Server::~Server() { stop(); }
 
-/* A finished video or a generated image to <media_out>/<sub>/<name>. A best effort copy:
- * the response is already decided when it happens, so a failure only logs. */
+namespace {
+/* The highest leading index ("0042-...") among the file names in dir; 0 when there is none.
+ * An index has at most 9 digits, so the 10-digit unix time that began names before the index
+ * existed ("1793051414-0-seed...png") is not taken for one. */
+uint64_t max_media_index(const std::string& dir) {
+    uint64_t best = 0;
+    std::error_code ec;
+    auto it = std::filesystem::directory_iterator(dir, ec);
+    const std::filesystem::directory_iterator end;
+    while (!ec && it != end) {
+        const auto u8 = it->path().filename().u8string();
+        const std::string n(reinterpret_cast<const char*>(u8.data()), u8.size());
+        size_t i = 0;
+        while (i < n.size() && n[i] >= '0' && n[i] <= '9') i++;
+        if (i > 0 && i <= 9 && i < n.size() && n[i] == '-')
+            best = std::max<uint64_t>(best, std::strtoull(n.c_str(), nullptr, 10));
+        it.increment(ec);
+    }
+    return best;
+}
+} // namespace
+
+/* The next index of the one sequence that images and videos share, from <media_out>/.index.
+ * The counter file is read, incremented and written back under an exclusive flock, so two
+ * saves never get one index, in this process (with the mutex) or in another engine writing to
+ * the same share. A missing or empty counter starts after the highest index already on disk.
+ * 0 when the counter cannot be used; the file is then saved without an index. */
+uint64_t Server::next_media_index() {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    const std::string path = opt_.media_out + "/.index";
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        RAD_WARN("media out: %s: %s; saving without an index", path.c_str(), strerror(errno));
+        return 0;
+    }
+#if defined(_WIN32)
+    auto lock_ex = [](int f) { return rad::os::flock_fd(f, rad::os::LockEx); };
+    auto lock_un = [](int f) { return rad::os::flock_fd(f, rad::os::LockUn); };
+#else
+    auto lock_ex = [](int f) { return ::flock(f, LOCK_EX); };
+    auto lock_un = [](int f) { return ::flock(f, LOCK_UN); };
+#endif
+    const bool locked = lock_ex(fd) == 0;
+    if (!locked)
+        RAD_WARN("media out: flock %s: %s; the index is unique in this process only", path.c_str(),
+                 strerror(errno));
+    char buf[32] = {0};
+    const ssize_t got = ::pread(fd, buf, sizeof buf - 1, 0);
+    uint64_t last = got > 0 ? std::strtoull(buf, nullptr, 10) : 0;
+    if (last == 0)
+        last = std::max(max_media_index(opt_.media_out + "/images"),
+                        max_media_index(opt_.media_out + "/videos"));
+    const uint64_t next = last + 1;
+    const std::string s = std::to_string(next) + "\n";
+    if (::pwrite(fd, s.data(), s.size(), 0) != (ssize_t)s.size() || ::ftruncate(fd, (off_t)s.size()) != 0) {
+        RAD_WARN("media out: %s: %s; saving without an index", path.c_str(), strerror(errno));
+        if (locked) lock_un(fd);
+        ::close(fd);
+        return 0;
+    }
+    ::fsync(fd);
+    if (locked) lock_un(fd);
+    ::close(fd);
+    return next;
+}
+
+/* A finished video or a generated image to <media_out>/<sub>/<index>-<name>, the index zero
+ * padded to 4 digits (next_media_index). A best effort copy: the response is already decided
+ * when it happens, so a failure only logs. */
 void Server::persist_media_file(const std::string& sub, const std::string& name,
                                 const void* data, size_t len) {
-    const std::string path = opt_.media_out + "/" + sub + "/" + name;
+    std::string indexed = name;
+    if (const uint64_t idx = next_media_index()) {
+        char p[24];
+        std::snprintf(p, sizeof p, "%04llu-", (unsigned long long)idx);
+        indexed = p + name;
+    }
+    const std::string path = opt_.media_out + "/" + sub + "/" + indexed;
     std::ofstream f(path, std::ios::binary);
     if (!f) { RAD_WARN("media out: %s: %s", path.c_str(), strerror(errno)); return; }
     f.write((const char*)data, (std::streamsize)len);

@@ -830,11 +830,9 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         if (s < 0) return s;
         *b64 = base64_encode(file.data(), file.size());
         if (!opt_.media_out.empty() && !im.preview) {
-            static std::atomic<uint64_t> n{0};
+            // persist_media_file prefixes the shared index, which keeps names unique.
             const std::string name =
-                std::to_string((int64_t)std::time(nullptr)) + "-" + std::to_string(im.index) +
-                "-seed" + std::to_string(im.seed) + "-" + std::to_string(n.fetch_add(1)) +
-                "." + fmt;
+                std::to_string(im.index) + "-seed" + std::to_string(im.seed) + "." + fmt;
             persist_media_file("images", name, file.data(), file.size());
         }
         return RAD_OK;

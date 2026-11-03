@@ -178,6 +178,7 @@ void Metrics::sample(const SchedMetrics& m) {
     }
     c_preemptions_.advance_to(m.preemptions);
     c_preempt_forced_.advance_to(m.preempt_forced);
+    c_admit_kv_held_.advance_to(m.admit_kv_held);
     c_steps_.advance_to(m.steps);
     c_steps_prefill_.advance_to(m.steps_prefill);
     c_steps_mixed_.advance_to(m.steps_mixed);
@@ -345,6 +346,9 @@ std::string Metrics::render() const {
     w.counter("radiance:preempt_forced_total",
               "Preempted prefill waits that ended by reclaiming cache blocks and forcing a "
               "lowest-priority running victim (--preempt-wait-ms).", L, c_preempt_forced_.get());
+    w.counter("radiance:admit_kv_held_total",
+              "Requests admission held in the queue until the KV pool could hold their whole "
+              "prompt (--admit-kv-reserve).", L, c_admit_kv_held_.get());
 
     w.help("vllm:request_success_total",
            "Count of successfully processed requests.", "counter");

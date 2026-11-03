@@ -2140,6 +2140,96 @@ TEST(a_preempted_prefill_waits_for_the_whole_prompt_and_running_headroom) {
     f.commit_plain();
 }
 
+/* --admit-kv-reserve: A NEW REQUEST WAITS IN THE QUEUE until the pool holds its whole prompt beside
+ * what the running sequences still need, each with the reserve. Without the gate the same pair is
+ * admitted together and B is preempted on its next block (the test above). Requests behind a held
+ * one wait too, even one that would fit, so a long prompt is not passed over for good. */
+TEST(a_new_request_waits_for_kv_room_instead_of_being_preempted) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.admit_kv_reserve = 64;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(287, 64, /*priority=*/5);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+
+    /* A wants (288 + 64) / 16 = 22 blocks and B (128 + 64) / 16 = 12: B waits. C needs 2 and
+     * would fit, but it queued behind B. */
+    const uint64_t b = f.submit(128, 64, /*priority=*/0);
+    const uint64_t c = f.submit(16, 8, /*priority=*/0);
+    for (int i = 0; i < 200 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+        CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().admit_kv_held, 1);
+
+    /* A's blocks are back: B and then C are admitted, and nothing was ever preempted. */
+    for (int i = 0; i < 400 && (f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(c)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* --admit-backfill-ms: while B is held, C (which fits) is admitted past it; once B has been held
+ * longer than the window, D (which also fits) is not, so the pool drains for B. */
+TEST(a_held_request_lets_smaller_ones_pass_only_for_the_backfill_window) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);   /* 26 x 16 = 416 tokens */
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(287, 64, /*priority=*/5);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const uint64_t b = f.submit(128, 64);    /* 12 blocks beside A's 22: held */
+    const uint64_t c = f.submit(16, 8);      /* 2 blocks: fits, passes B */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK((int)f.sch.find(c)->state != (int)ReqState::Waiting);
+    for (int i = 0; i < 50 && f.sch.find(c)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    const uint64_t d = f.submit(16, 8);
+    if (f.sch.find(a)->state != ReqState::Finished) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Waiting);
+    }
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* Two new requests admitted in one step are each checked against the other: with A running,
+ * B and C each fit beside A alone, but not together, so C is held. */
+TEST(one_step_admits_new_requests_against_each_other_too) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 16;
+    f.cfg.admit_backfill_ms = 60000;
+    CHECK_OK(f.start());
+    f.submit(127, 16);                       /* A: (128 + 16) / 16 = 9 blocks */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const uint64_t b = f.submit(112, 16);    /* 8 blocks: 17 with A */
+    const uint64_t c = f.submit(144, 16);    /* 10 blocks: 19 with A, 27 with A and B */
+    CHECK(f.sch.step() != nullptr);
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().admit_kv_held, 1);
+    f.commit_plain();
+}
+
 /* The whole-recompute predicate counts blocks the cache can lend back, not entries it already
  * holds. With nothing running, the old gate never entered its victim loop, so a pool filled by
  * finished conversations kept an overdue preempted request in Preempted forever -- the daily's

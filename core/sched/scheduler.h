@@ -53,6 +53,8 @@ struct SchedReq {
                                   * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
+    int64_t  held_us = 0;        /* when admission first held it for KV room (--admit-kv-reserve);
+                                  * 0 if never. Bounds how long others may pass it (--admit-backfill-ms). */
 
     /* The drafter's proposal for the next step, and the conv-window read cursor a rejection
      * moves rather than rolls back (§10). */
@@ -944,6 +946,11 @@ private:
     /* A fresh prefill: the whole prompt plus one decode position fits in every FULL paged group,
      * with one block past that for every running sequence. WINDOW/RING recycle. */
     bool fresh_prefill_can_fit(const SchedReq& s) const;
+    /* --admit-kv-reserve: whether the pool can hold a new request's whole prompt plus the reserve
+     * beside what every running sequence, and every request this step already admitted, still needs (the rest of its prompt, or its next token,
+     * plus the reserve). Blocks only the prefix cache holds count as free, since admission can
+     * reclaim them; a block two sequences share counts once for each, which errs toward waiting. */
+    bool fresh_fits(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
@@ -955,6 +962,9 @@ private:
     /* Positive sentinel from admit_one: the request waits (its context is still being read off
      * disk, or a preempted prefill has no room yet) and the walk may ask the one behind it. */
     static constexpr int kAdmitWait = 1;
+    /* Positive sentinel from admit_one: a new request waits for KV room (--admit-kv-reserve).
+     * Smaller requests behind it may pass for --admit-backfill-ms; after that, nothing does. */
+    static constexpr int kAdmitHold = 2;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
     /* A step's prefill entries while step() moves its decode entries first; reserved at init,

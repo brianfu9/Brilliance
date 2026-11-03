@@ -906,6 +906,15 @@ struct Config {
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
     int64_t preempt_wait_ms = 5000;
+    /* --admit-kv-reserve: tokens of decode room admission keeps for every sequence. A new request
+     * waits in the queue until the pool can hold its whole prompt and every running sequence's
+     * remaining prompt, each plus this much output; requests behind it wait too, unless
+     * --admit-backfill-ms lets them pass. 0 = off: a new
+     * request is admitted on its next chunk's blocks and may be preempted as the batch grows. */
+    int64_t admit_kv_reserve = 0;
+    /* --admit-backfill-ms: how long requests behind one --admit-kv-reserve holds may be admitted
+     * past it when they fit. After that nothing passes it until it is admitted. 0 = never. */
+    int64_t admit_backfill_ms = 0;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the

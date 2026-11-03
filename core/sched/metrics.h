@@ -27,6 +27,8 @@ struct SchedMetrics {
     /* --preempt-wait-ms fallback: waits that ended by evicting cache blocks and forcing a running
      * victim, not just by the pool freeing itself. */
     int64_t preempt_forced = 0;
+    /* --admit-kv-reserve: requests admission held at least once for KV room. */
+    int64_t admit_kv_held = 0;
     int64_t steps = 0;
 
     /* Steps by shape. `steps_mixed` counts steps carrying both a prefill chunk and decode rows.

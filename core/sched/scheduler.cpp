@@ -474,6 +474,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
      * admission of whichever request held the slot before. The re-admission guard below needs
      * it zero for the same reason -- a stale stamp would read as an earlier admission. */
     s.admitted_us = 0;
+    s.held_us = 0;
     s.slot = slot;
     s.card = -1;
     s.running = false;
@@ -1576,6 +1577,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
         }
     }
 
+    /* A NEW REQUEST WAITS FOR ROOM FOR ITS WHOLE PROMPT (--admit-kv-reserve), so the batch does
+     * not outgrow the pool and preempt a running sequence, whose recompute repeats its prefill.
+     * An idle engine admits anything: can_ever_fit already refused what an empty pool cannot hold. */
+    if (cfg_.admit_kv_reserve > 0 && r.state == ReqState::Waiting && r.n_computed == 0 &&
+        !running_.empty() && !fresh_fits(s)) {
+        if (s.held_us == 0) {
+            s.held_us = mono_us();
+            ++m_.admit_kv_held;
+            RAD_DEBUG("admit %llu: %lld tokens wait for KV room (--admit-kv-reserve %lld)",
+                      (unsigned long long)r.id, (long long)s.seq_len(),
+                      (long long)cfg_.admit_kv_reserve);
+        }
+        return kAdmitHold;
+    }
+
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
 
     /* R-SWA: the visible set becomes [0, prompt) plus a ring of W once the prompt is placed. The
@@ -2014,6 +2030,40 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     for (int32_t slot : running_) {
         const SchedReq& rs = *reqs_[(size_t)slot];
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
+    }
+    return true;
+}
+
+bool Scheduler::fresh_fits(const SchedReq& s) const {
+    const int64_t res = cfg_.admit_kv_reserve;
+    /* The reserve, but no more output than the request may still generate. */
+    auto room = [res](const Request& r) {
+        if (r.max_tokens <= 0) return res;
+        return std::max<int64_t>(0, std::min<int64_t>(res, (int64_t)r.max_tokens - (int64_t)r.output.size()));
+    };
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        const int64_t total = kv_->total_blocks((int32_t)g);
+        if (!gg.paged || total <= 0) continue;
+        /* Elastic KV (Brilliance): held_blocks + available_blocks = live + recallable flex room,
+         * equals total_blocks without flex. Deciding on live alone would livelock flex growth. */
+        const int64_t cap = std::min(total, kv_->held_blocks((int32_t)g) + kv_->available_blocks((int32_t)g));
+        const int64_t bs = gg.block_size;
+        int64_t need = (s.seq_len() + room(*s.req) + bs - 1) / bs;
+        auto add = [&](int32_t slot) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) return;
+            const Request& rr = *rs.req;
+            int64_t goal = std::max<int64_t>(rr.n_computed + 1, (int64_t)rr.prompt.size());
+            goal = std::max(goal, rs.seq_len());
+            const int64_t rows = (goal + room(rr) + bs - 1) / bs;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            need += std::max(rows, held);
+        };
+        for (int32_t slot : running_) add(slot);
+        /* This step's earlier admissions join running_ only after the walk. */
+        for (size_t at : took_) add(waiting_[at]);
+        if (need > cap) return false;
     }
     return true;
 }
@@ -2548,6 +2598,13 @@ const RadBatch* Scheduler::step() {
                 if (room_wait_) break;
                 ++at;
                 continue;
+            }
+            /* A held request lets smaller ones behind it in, for --admit-backfill-ms; after
+             * that nothing passes it, so the pool drains until it fits. */
+            if (as == kAdmitHold) {
+                if (cfg_.admit_backfill_ms > 0 &&
+                    mono_us() - s.held_us < cfg_.admit_backfill_ms * 1000) { ++at; continue; }
+                break;
             }
             if (as < 0 && admission_failure_ == AdmissionFailure::Allocator) {
                 close_request(s, ReqState::Failed, "admission_allocator", false, true, as,

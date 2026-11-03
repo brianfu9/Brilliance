@@ -90,6 +90,13 @@ static const Flag g_flags[] = {
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
                                         "(default 5000) falls back on the next step" },
+    { "--admit-kv-reserve",   "N",      "admit a new request only when the KV pool holds its whole\n"
+                                        "prompt and every running sequence's, each plus N tokens of\n"
+                                        "output; it waits in the queue until then. 0 (default) admits\n"
+                                        "on the next chunk and preempts when the pool runs out" },
+    { "--admit-backfill-ms",  "N",      "how long smaller requests may be admitted past one\n"
+                                        "--admit-kv-reserve holds; after that nothing passes it.\n"
+                                        "0 (default) never" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
@@ -762,6 +769,8 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
+        else if (S("--admit-kv-reserve"))      { if (!num(0, INT64_MAX, &c->admit_kv_reserve)) return RAD_E_INVAL; }
+        else if (S("--admit-backfill-ms"))     { if (!num(0, INT64_MAX, &c->admit_backfill_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
         else if (S("--rope-scaling")) {
@@ -1809,6 +1818,10 @@ const ShowRow kShow[] = {
     { "--prefill-room-gate", [](const Config& c) {
           return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
+    { "--admit-backfill-ms",  [](const Config& c) {
+          return c.admit_backfill_ms > 0 ? num(c.admit_backfill_ms) : std::string("off"); } },
+    { "--admit-kv-reserve",   [](const Config& c) {
+          return c.admit_kv_reserve > 0 ? num(c.admit_kv_reserve) : std::string("off"); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {
           return c.max_ctx ? num(c.max_ctx) : std::string("0 (the model's training context)"); } },

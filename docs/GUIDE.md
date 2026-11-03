@@ -2649,6 +2649,8 @@ platform limits and qualification gaps. Grouped by purpose:
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
+| `admit-kv-reserve: N` | 0 | admit a new request only when the KV pool can hold its whole prompt and every running sequence's remaining prompt, each plus `N` tokens of output; until then it and every request behind it wait in the queue (see `admit-backfill-ms`), instead of entering the batch and preempting a sequence when the pool runs out; `0` is off (local patch) |
+| `admit-backfill-ms: N` | 0 | how long smaller requests behind one that `admit-kv-reserve` holds may be admitted past it when they fit; after that nothing passes it until it is admitted, so a long prompt is not starved; `0` never lets one pass (local patch) |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |
 | `max-model-len: N` | 0 | context bound; 0 takes the model's training context |
@@ -4588,6 +4590,7 @@ always 1 and carries the cache's settings as labels: `cache_dtype`, `block_size`
 | `prefix_cache_released_total{what}` | entries and snapshots clients forgot through `DELETE /sessions` (§4.8) |
 | `num_requests_preempted` | | 
 | `preempt_forced_total` | preempted prefill waits that ended by reclaiming cache blocks and forcing a lowest-priority running victim (`preempt-wait-ms`) |
+| `admit_kv_held_total` | requests `admit-kv-reserve` held in the queue until the KV pool could hold their whole prompt (local patch) |
 | `http_queue_depth`, `http_responses_total`, `http_admission_rejected_total` | |
 | `client_disconnect_total`, `stream_overflow_total` | |
 

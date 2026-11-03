@@ -141,7 +141,8 @@ private:
      * difference). Concurrent scrapes would both add the same difference, so they are serialised. */
     std::mutex sample_mu_;
 
-    Counter c_prompt_tokens_, c_generation_tokens_, c_preemptions_, c_preempt_forced_;
+    Counter c_prompt_tokens_, c_generation_tokens_, c_preemptions_, c_preempt_forced_,
+            c_admit_kv_held_;
     /* Engine steps. With speculation a step emits 1 + the accepted drafts, so tokens/s does not
      * give step time; two scrapes of this counter and a clock do. */
     Counter c_steps_;

@@ -136,6 +136,7 @@ struct SchedMetrics {
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
     int64_t preemptions = 0;
     int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
+    int64_t admit_kv_held = 0;        /* --admit-kv-reserve: requests held for KV room */
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step
      * emits more than one token, so step time cannot be derived from tokens per second. */

@@ -2210,6 +2210,29 @@ TEST(a_held_request_lets_smaller_ones_pass_only_for_the_backfill_window) {
     CHECK_EQ(f.sch.metrics().preemptions, 0);
 }
 
+/* The gate counts full-attention groups only. A window group's pool is sized for every
+ * sequence's window (KVManager::window_pool_cap) and recycles the blocks below it, so reading its
+ * total as room for whole sequences held every new request while one ran. FakeKV does not
+ * recycle, so only the total the gate reads is capped, as the real pool reports it. */
+TEST(the_kv_gate_reads_full_groups_and_not_a_window_pool) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096, /*windowed=*/true);
+    /* 30 blocks hold either sequence at full length but not both (22 + 12 below). */
+    f.kv.total[f.prog.kv_groups.size() - 1] = 30;
+    f.cfg.admit_kv_reserve = 64;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(287, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    /* attn: A (288 + 64) / 16 = 22 blocks and B (128 + 64) / 16 = 12, of 64: B fits. */
+    const uint64_t b = f.submit(128, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK((int)f.sch.find(a)->state != (int)ReqState::Waiting);
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().admit_kv_held, 0);
+}
+
 /* Two new requests admitted in one step are each checked against the other: with A running,
  * B and C each fit beside A alone, but not together, so C is held. */
 TEST(one_step_admits_new_requests_against_each_other_too) {

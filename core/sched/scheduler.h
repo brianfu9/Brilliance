@@ -949,7 +949,9 @@ private:
     /* --admit-kv-reserve: whether the pool can hold a new request's whole prompt plus the reserve
      * beside what every running sequence, and every request this step already admitted, still needs (the rest of its prompt, or its next token,
      * plus the reserve). Blocks only the prefix cache holds count as free, since admission can
-     * reclaim them; a block two sequences share counts once for each, which errs toward waiting. */
+     * reclaim them; a block two sequences share counts once for each, which errs toward waiting.
+     * Full-attention groups only: a window group's pool is sized for every sequence's window
+     * (KVManager::window_pool_cap) and recycles the blocks below it, so it never binds. */
     bool fresh_fits(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */

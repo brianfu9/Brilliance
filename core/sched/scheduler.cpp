@@ -2044,7 +2044,9 @@ bool Scheduler::fresh_fits(const SchedReq& s) const {
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
         const KVGeom::G& gg = kvgeom_.g[g];
         const int64_t total = kv_->total_blocks((int32_t)g);
-        if (!gg.paged || total <= 0) continue;
+        /* A window group is sized for every sequence's window (window_pool_cap); counting whole
+         * sequences against it held every new request while anything ran. */
+        if (gg.kind != RAD_KV_FULL || total <= 0) continue;
         /* Elastic KV (Brilliance): held_blocks + available_blocks = live + recallable flex room,
          * equals total_blocks without flex. Deciding on live alone would livelock flex growth. */
         const int64_t cap = std::min(total, kv_->held_blocks((int32_t)g) + kv_->available_blocks((int32_t)g));

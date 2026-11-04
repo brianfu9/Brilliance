@@ -2233,6 +2233,65 @@ TEST(the_kv_gate_reads_full_groups_and_not_a_window_pool) {
     CHECK_EQ(f.sch.metrics().admit_kv_held, 0);
 }
 
+/* The request table says why each waiting request waits, for a client drawing the queue: B is
+ * held for KV room, C passes it inside the backfill window, and D, after the window, waits
+ * behind B. */
+TEST(the_request_table_says_why_each_request_waits) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(287, 64, /*priority=*/5);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    auto rb_req = f.request(128, 64);
+    rb_req->priority = 2;
+    rb_req->tag = "ls-42";
+    const uint64_t b = f.add(std::move(rb_req));
+    const uint64_t c = f.submit(16, 8);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+
+    std::vector<Scheduler::ReqStat> st(8);
+    auto row = [&](uint64_t id) -> const Scheduler::ReqStat& {
+        const int n = f.sch.requests(st.data(), (int)st.size());
+        for (int i = 0; i < n; ++i)
+            if (st[(size_t)i].id == id) return st[(size_t)i];
+        static const Scheduler::ReqStat none;
+        return none;
+    };
+    {
+        const Scheduler::ReqStat& rb = row(b);
+        CHECK_EQ(std::string(rb.tag), std::string("ls-42"));
+        CHECK_EQ(rb.priority, 2);
+        CHECK_EQ(rb.queue_pos, 0);
+        CHECK_EQ(rb.wait_why, (int)Scheduler::kWaitKvHold);
+        CHECK(rb.held_s >= 0.0);
+        CHECK_EQ(rb.admit_tokens, (int64_t)192);   /* (128 + 64) / 16 = 12 blocks */
+    }
+    {
+        const Scheduler::ReqStat& ra = row(a);
+        CHECK_EQ(ra.queue_pos, -1);
+        CHECK(ra.admit_tokens >= (int64_t)(288 + 64) / 16 * 16);
+        CHECK(ra.held_s < 0.0);
+    }
+    CHECK_EQ(row(c).queue_pos, -1);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    const uint64_t d = f.submit(16, 8);
+    if (f.sch.find(a)->state != ReqState::Finished) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK_EQ(row(b).wait_why, (int)Scheduler::kWaitKvHold);
+        CHECK_EQ(row(d).queue_pos, 1);
+        CHECK_EQ(row(d).wait_why, (int)Scheduler::kWaitBehind);
+    }
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.admit_kv_reserve, 64);
+    CHECK_EQ(m.admit_backfill_ms, 50);
+}
+
 /* Two new requests admitted in one step are each checked against the other: with A running,
  * B and C each fit beside A alone, but not together, so C is held. */
 TEST(one_step_admits_new_requests_against_each_other_too) {

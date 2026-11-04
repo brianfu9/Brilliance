@@ -17,6 +17,9 @@ struct SchedMetrics {
     int64_t queue_depth = 0;         /* requests waiting, including preempted ones */
     int64_t running = 0;
     int64_t preempted_waiting = 0;   /* of queue_depth, how many are awaiting recompute */
+    /* The queue policy, as configured, so a client can draw what admission decides. */
+    int64_t admit_kv_reserve = 0;
+    int64_t admit_backfill_ms = 0;
 
     /* Cumulative counters. Monotonic, so a scraper can rate() them. */
     int64_t admitted = 0;

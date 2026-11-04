@@ -88,6 +88,8 @@ struct OaiRequest {
     /* The client's conversation name (OpenRouter's `session_id`), "" if none; only a label on
      * /sessions. */
     std::string session_label;
+    /* The X-Request-Tag header (Request::tag), "" if none. */
+    std::string tag;
     /* The build, as OpenAI's and llama.cpp's `system_fingerprint`. */
     std::string system_fingerprint;
 

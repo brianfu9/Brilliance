@@ -148,6 +148,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.preemptions = m.preemptions;
     o.preempt_forced = m.preempt_forced;
     o.admit_kv_held = m.admit_kv_held;
+    o.admit_kv_reserve = m.admit_kv_reserve;
+    o.admit_backfill_ms = m.admit_backfill_ms;
     o.total_requests = m.admitted;
     o.steps = m.steps;
     o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;
@@ -322,6 +324,20 @@ public:
             o.ttft_s          = r.ttft_s;
             o.prefill_s       = r.prefill_s;
             o.decode_tps      = r.decode_tps;
+            o.tag             = r.tag;
+            o.priority        = r.priority;
+            o.queue_pos       = r.queue_pos;
+            o.held_s          = r.held_s;
+            o.admit_tokens    = r.admit_tokens;
+            if (r.queue_pos >= 0) {
+                switch (r.wait_why) {
+                    case Scheduler::kWaitKvHold: o.wait = "kv_hold"; break;
+                    case Scheduler::kWaitKvRoom: o.wait = "kv_room"; break;
+                    case Scheduler::kWaitBehind: o.wait = "behind";  break;
+                    case Scheduler::kWaitMedia:  o.wait = "media";   break;
+                    default:                     o.wait = "queued";  break;
+                }
+            }
             out->push_back(std::move(o));
         }
         return n;

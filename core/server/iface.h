@@ -137,6 +137,9 @@ struct SchedMetrics {
     int64_t preemptions = 0;
     int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
     int64_t admit_kv_held = 0;        /* --admit-kv-reserve: requests held for KV room */
+    /* The queue policy as configured: --admit-kv-reserve, --admit-backfill-ms. */
+    int64_t admit_kv_reserve = 0;
+    int64_t admit_backfill_ms = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step
      * emits more than one token, so step time cannot be derived from tokens per second. */
@@ -228,6 +231,14 @@ struct RequestStat {
     double      ttft_s = -1;       /* negative until the first token */
     double      prefill_s = -1;    /* first token minus admission; negative until both */
     double      decode_tps = 0;
+    /* The queue's view (Scheduler::ReqStat). `wait` names Scheduler::WaitWhy while waiting:
+     * queued | kv_hold | kv_room | behind | media. */
+    std::string tag;               /* the client's X-Request-Tag, "" if none */
+    int32_t     priority = 0;
+    int32_t     queue_pos = -1;
+    double      held_s = -1;
+    std::string wait;
+    int64_t     admit_tokens = 0;
 };
 
 class IScheduler {

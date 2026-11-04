@@ -2890,7 +2890,7 @@ keys are refused on it, and so are the pixel bands.
 | `POST /reset_prefix_cache` | drop every cached prefix |
 | `DELETE /sessions/<label>`, `DELETE /sessions?id=<id>` | forget one stored conversation (§4.8) |
 | `GET /` or `/dashboard` | the web dashboard |
-| `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from |
+| `GET /stats`, `/graph`, `/sessions` | the JSON the dashboard is drawn from; each `/stats` request carries `priority` and the client's `X-Request-Tag` header as `tag`, and while waiting `queue_pos` and `wait` (`queued`, `kv_hold`, `kv_room`, `behind`, `media`), plus `held_s` and `admit_tokens` under `--admit-kv-reserve`; `queue` gives the reserve, backfill window and aging (local patch) |
 | `GET /history` | the last hour the process sampled, one sample a second: what the dashboard draws (§6.1) |
 | `GET /v1/loras`, `POST /v1/load_lora_adapter`, `POST /v1/unload_lora_adapter` | runtime LoRA adapters: list, add and remove (§4.9.1, §4.9.2) |
 | `GET\|POST /admin/control-vector` | the deployment's control-vector default (§4.10) |

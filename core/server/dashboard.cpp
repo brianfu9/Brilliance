@@ -494,9 +494,18 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             if (q.ttft_s >= 0) j["ttft_s"] = q.ttft_s;
             if (q.prefill_s >= 0) j["prefill_s"] = q.prefill_s;
             j["tps"]       = q.decode_tps;
+            if (!q.tag.empty()) j["tag"] = q.tag;
+            j["priority"]  = q.priority;
+            if (q.queue_pos >= 0) { j["queue_pos"] = q.queue_pos; j["wait"] = q.wait; }
+            if (q.held_s >= 0) j["held_s"] = q.held_s;
+            if (q.admit_tokens > 0) j["admit_tokens"] = q.admit_tokens;
             reqs.push_back(std::move(j));
         }
         o["requests"] = std::move(reqs);
+        /* What admission decides with, so a client can redraw it: the reserve each request
+         * carries, and how long a held one lets others pass. */
+        o["queue"] = { { "kv_reserve",  m.admit_kv_reserve },
+                       { "backfill_ms", m.admit_backfill_ms } };
     }
 
     /* The engine's snapshot. Absent without a snapshot function, and the page then omits those

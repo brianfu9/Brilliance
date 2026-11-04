@@ -837,6 +837,9 @@ struct Request {
     /* The client's conversation id (OpenRouter's `session_id`), "" when absent. A label for the
      * prefix cache's session on /sessions and the dashboard; it does not affect serving. */
     std::string          session_label;
+    /* The client's own id for this request (an X-Request-Tag header, at most 23 bytes), "" when
+     * absent. Echoed on /stats so a proxy can join its view of the request to the scheduler's. */
+    std::string          tag;
 
     std::string          finish_reason;
     void*                sink = nullptr;      /* the server's per-request stream sink */

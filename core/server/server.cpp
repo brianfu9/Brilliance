@@ -697,6 +697,7 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;
             rq.session_label = r.session_label;
+            rq.tag = r.tag;
             rq.lora_slot = lora_slot;
             rq.lora_uid = lora_uid;
             g.lora_hold = lora_hold;
@@ -1685,6 +1686,8 @@ HttpResponse Server::handle_messages(const HttpRequest& req) {
 
 HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
     r.peer = req.peer;
+    if (auto t = req.headers.find("X-Request-Tag"); t != req.headers.end())
+        r.tag = t->second.substr(0, 23);
     if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
         return *no;
     log_admitted(r);

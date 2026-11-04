@@ -1062,6 +1062,21 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
          * decode. */
         const double dec = s.first_tok_us ? (double)(now - s.first_tok_us) / 1e6 : 0.0;
         o.decode_tps      = dec > 1e-3 ? (double)r.output.size() / dec : 0.0;
+        std::snprintf(o.tag, sizeof o.tag, "%s", r.tag.c_str());
+        o.priority        = r.priority;
+        o.held_s          = s.held_us ? (double)(now - s.held_us) / 1e6 : -1.0;
+        o.wait_why        = s.wait_why;
+        o.queue_pos       = -1;
+        for (size_t k = 0; k < waiting_.size(); ++k)
+            if (waiting_[k] == s.slot) { o.queue_pos = (int32_t)k; break; }
+        /* On the first full group, as fresh_fits counts it; the groups share one token axis. */
+        o.admit_tokens = 0;
+        if (cfg_.admit_kv_reserve > 0)
+            for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+                if (kvgeom_.g[g].kind != RAD_KV_FULL || kv_->total_blocks((int32_t)g) <= 0) continue;
+                o.admit_tokens = gate_blocks(s, g, !s.running) * kvgeom_.g[g].block_size;
+                break;
+            }
     }
     std::sort(out, out + n, [](const ReqStat& a, const ReqStat& b) { return a.id < b.id; });
     return n;
@@ -2034,37 +2049,38 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     return true;
 }
 
-bool Scheduler::fresh_fits(const SchedReq& s) const {
-    const int64_t res = cfg_.admit_kv_reserve;
+int64_t Scheduler::gate_blocks(const SchedReq& s, size_t g, bool fresh) const {
+    const Request& r = *s.req;
+    const int64_t bs = kvgeom_.g[g].block_size;
     /* The reserve, but no more output than the request may still generate. */
-    auto room = [res](const Request& r) {
-        if (r.max_tokens <= 0) return res;
-        return std::max<int64_t>(0, std::min<int64_t>(res, (int64_t)r.max_tokens - (int64_t)r.output.size()));
-    };
+    const int64_t res = cfg_.admit_kv_reserve;
+    const int64_t room = r.max_tokens <= 0
+        ? res : std::max<int64_t>(0, std::min<int64_t>(res, (int64_t)r.max_tokens - (int64_t)r.output.size()));
+    if (fresh) return (s.seq_len() + room + bs - 1) / bs;
+    int64_t goal = std::max<int64_t>(r.n_computed + 1, (int64_t)r.prompt.size());
+    goal = std::max(goal, s.seq_len());
+    const int64_t rows = (goal + room + bs - 1) / bs;
+    const int64_t held = (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+    return std::max(rows, held);
+}
+
+bool Scheduler::fresh_fits(const SchedReq& s) const {
     for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
-        const KVGeom::G& gg = kvgeom_.g[g];
         const int64_t total = kv_->total_blocks((int32_t)g);
         /* A window group is sized for every sequence's window (window_pool_cap); counting whole
          * sequences against it held every new request while anything ran. */
-        if (gg.kind != RAD_KV_FULL || total <= 0) continue;
+        if (kvgeom_.g[g].kind != RAD_KV_FULL || total <= 0) continue;
         /* Elastic KV (Brilliance): held_blocks + available_blocks = live + recallable flex room,
          * equals total_blocks without flex. Deciding on live alone would livelock flex growth. */
         const int64_t cap = std::min(total, kv_->held_blocks((int32_t)g) + kv_->available_blocks((int32_t)g));
-        const int64_t bs = gg.block_size;
-        int64_t need = (s.seq_len() + room(*s.req) + bs - 1) / bs;
-        auto add = [&](int32_t slot) {
-            const SchedReq& rs = *reqs_[(size_t)slot];
-            if (!rs.req) return;
-            const Request& rr = *rs.req;
-            int64_t goal = std::max<int64_t>(rr.n_computed + 1, (int64_t)rr.prompt.size());
-            goal = std::max(goal, rs.seq_len());
-            const int64_t rows = (goal + room(rr) + bs - 1) / bs;
-            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
-            need += std::max(rows, held);
-        };
-        for (int32_t slot : running_) add(slot);
+        int64_t need = gate_blocks(s, g, true);
+        for (int32_t slot : running_)
+            if (reqs_[(size_t)slot]->req) need += gate_blocks(*reqs_[(size_t)slot], g, false);
         /* This step's earlier admissions join running_ only after the walk. */
-        for (size_t at : took_) add(waiting_[at]);
+        for (size_t at : took_) {
+            const SchedReq& t = *reqs_[(size_t)waiting_[at]];
+            if (t.req) need += gate_blocks(t, g, false);
+        }
         if (need > cap) return false;
     }
     return true;
@@ -2527,6 +2543,8 @@ const RadBatch* Scheduler::step() {
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */
         took_.clear();
+        /* Until the walk says otherwise, a waiting request was not reached this step. */
+        for (int32_t w : waiting_) reqs_[(size_t)w]->wait_why = kWaitQueued;
         size_t at = 0;
         bool reclaimed_idle_states = false;
         while (at < waiting_.size() &&
@@ -2549,7 +2567,7 @@ const RadBatch* Scheduler::step() {
             }
             /* Media first: a request whose items are not encoded keeps its place and the next is
              * asked; the engine encodes before the next step (encodes_pending). */
-            if (s.req->media && !media_ready(s)) { ++at; continue; }
+            if (s.req->media && !media_ready(s)) { s.wait_why = kWaitMedia; ++at; continue; }
             /* Leave one share for the next queued request when there is one and a slot for it
              * (busy_cap). Embed inputs are whole-or-nothing, so a share could only turn their
              * admission into a refusal. */
@@ -2593,6 +2611,7 @@ const RadBatch* Scheduler::step() {
              * same victim was forced off and re-admitted 26 times in 16 s while the overdue request
              * waited. */
             if (as == kAdmitWait) {
+                s.wait_why = kWaitKvRoom;
                 if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
                 /* A fresh prompt waiting for room holds the queue behind it: shorter requests
                  * admitted past it would keep taking the room it waits for, and nothing ages a
@@ -2604,8 +2623,11 @@ const RadBatch* Scheduler::step() {
             /* A held request lets smaller ones behind it in, for --admit-backfill-ms; after
              * that nothing passes it, so the pool drains until it fits. */
             if (as == kAdmitHold) {
+                s.wait_why = kWaitKvHold;
                 if (cfg_.admit_backfill_ms > 0 &&
                     mono_us() - s.held_us < cfg_.admit_backfill_ms * 1000) { ++at; continue; }
+                for (size_t k = at + 1; k < waiting_.size(); ++k)
+                    reqs_[(size_t)waiting_[k]]->wait_why = kWaitBehind;
                 break;
             }
             if (as < 0 && admission_failure_ == AdmissionFailure::Allocator) {
@@ -2648,7 +2670,12 @@ const RadBatch* Scheduler::step() {
                               "overdue preempted prefill could not be admitted on an idle engine");
                 continue;
             }
-            if (as < 0) break;                     /* head of line: do not admit behind it */
+            if (as < 0) {                          /* head of line: do not admit behind it */
+                s.wait_why = kWaitKvRoom;
+                for (size_t k = at + 1; k < waiting_.size(); ++k)
+                    reqs_[(size_t)waiting_[k]]->wait_why = kWaitBehind;
+                break;
+            }
             if (admit_full_ > s.sched_tokens && capped_at < 0) {
                 capped_at = (int32_t)plan_.e.size();
                 capped_full = admit_full_;
@@ -4058,6 +4085,8 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.running = (int64_t)running_.size();
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;
+    m.admit_kv_reserve  = cfg_.admit_kv_reserve;
+    m.admit_backfill_ms = cfg_.admit_backfill_ms;
     for (int32_t slot : waiting_)
         if (reqs_[(size_t)slot]->req->state == ReqState::Preempted) ++m.preempted_waiting;
 

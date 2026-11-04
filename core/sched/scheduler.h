@@ -55,6 +55,8 @@ struct SchedReq {
                                   * whole-recompute admission wait (--preempt-wait-ms). */
     int64_t  held_us = 0;        /* when admission first held it for KV room (--admit-kv-reserve);
                                   * 0 if never. Bounds how long others may pass it (--admit-backfill-ms). */
+    uint8_t  wait_why = 0;       /* Scheduler::WaitWhy: what the last admission walk said, for
+                                  * the live request table only */
 
     /* The drafter's proposal for the next step, and the conv-window read cursor a rejection
      * moves rather than rolls back (§10). */
@@ -320,6 +322,23 @@ public:
         double   ttft_s = -1;          /* negative until the first token */
         double   prefill_s = -1;       /* first token minus admission; negative until both */
         double   decode_tps = 0;       /* this request's own, since its first token */
+        /* The queue's view, for a client drawing why a request waits. */
+        char     tag[24] = {};         /* Request::tag; a fixed buffer, so publishing never allocates */
+        int32_t  priority = 0;
+        int32_t  queue_pos = -1;       /* index in service order while waiting, else -1 */
+        double   held_s = -1;          /* since admission first held it for KV room; negative if never */
+        int      wait_why = 0;         /* WaitWhy, meaningful while waiting */
+        /* The full-attention tokens --admit-kv-reserve counts for it: held or needed context plus
+         * its output reserve, in whole blocks. 0 with the gate off. */
+        int64_t  admit_tokens = 0;
+    };
+    /* Why a waiting request was not admitted by the last walk. */
+    enum WaitWhy : uint8_t {
+        kWaitQueued = 0,   /* not reached: the step filled (batch, token budget) or a prefill held it */
+        kWaitKvHold,       /* --admit-kv-reserve: its prompt and reserve do not fit beside the batch */
+        kWaitKvRoom,       /* the pool cannot place it yet (a preempted recompute's whole-room wait) */
+        kWaitBehind,       /* a request ahead of it is held past its backfill window, or failed */
+        kWaitMedia,        /* its images or audio are still being encoded */
     };
     /* Oldest first, since the oldest is the one most likely stuck. Returns how many were
      * written. */
@@ -953,6 +972,9 @@ private:
      * Full-attention groups only: a window group's pool is sized for every sequence's window
      * (KVManager::window_pool_cap) and recycles the blocks below it, so it never binds. */
     bool fresh_fits(const SchedReq& s) const;
+    /* The blocks fresh_fits counts for `s` in paged group `g`: a `fresh` request's whole prompt,
+     * or what an admitted one holds or still needs, plus its output reserve. */
+    int64_t gate_blocks(const SchedReq& s, size_t g, bool fresh) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();

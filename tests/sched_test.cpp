@@ -2210,6 +2210,51 @@ TEST(a_held_request_lets_smaller_ones_pass_only_for_the_backfill_window) {
     CHECK_EQ(f.sch.metrics().preemptions, 0);
 }
 
+/* The gate when the running set drains: B and C were both held behind A, and each fits the empty
+ * pool alone but not beside the other. The step after A finishes must admit one of them, not both:
+ * this step's admissions join running_ only after the walk, so a gate that is skipped while
+ * running_ is empty let every held request in at once, over-committed the pool and preempted one
+ * (2026-11-14: two held 207k/211k prompts admitted together in a 349k pool). */
+TEST(a_drained_pool_admits_held_requests_against_each_other) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);   /* 64 x 16 = 1024 tokens; a first chunk is 256 */
+    f.cfg.admit_kv_reserve = 64;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(400, 8, /*priority=*/5);
+    for (int i = 0; i < 8 && f.sch.find(a)->n_computed < 400; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    /* Each (560 + 64) / 16 = 39 blocks: either fits the 64 alone, not both, nor beside A's
+     * (400 + 8) / 16 = 26. Their first 256-token chunks (16 blocks each) do fit together, as two
+     * 200k prompts' first 2048-token chunks fit a 349k pool. */
+    const uint64_t b = f.submit(560, 64);
+    const uint64_t c = f.submit(560, 64);
+    for (int i = 0; i < 200 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+
+    /* The first step on the drained pool admits B only. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    f.commit_plain();
+
+    for (int i = 0; i < 2000 && (f.sch.find(b)->state != ReqState::Finished ||
+                                 f.sch.find(c)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
 /* The gate counts full-attention groups only. A window group's pool is sized for every
  * sequence's window (KVManager::window_pool_cap) and recycles the blocks below it, so reading its
  * total as room for whole sequences held every new request while one ran. FakeKV does not

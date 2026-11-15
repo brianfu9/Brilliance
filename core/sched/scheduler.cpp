@@ -1594,9 +1594,13 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
 
     /* A NEW REQUEST WAITS FOR ROOM FOR ITS WHOLE PROMPT (--admit-kv-reserve), so the batch does
      * not outgrow the pool and preempt a running sequence, whose recompute repeats its prefill.
-     * An idle engine admits anything: can_ever_fit already refused what an empty pool cannot hold. */
+     * An idle engine admits anything: can_ever_fit already refused what an empty pool cannot hold.
+     * Idle means nothing running AND nothing admitted earlier in this walk: this step's admissions
+     * (took_) join running_ only after the walk, so testing running_ alone let every held request
+     * in at once when the pool drained, over-committed it and preempted the last (2026-11-14 on
+     * locally: two held 207k/211k prompts admitted together in a 349k pool). fresh_fits counts took_. */
     if (cfg_.admit_kv_reserve > 0 && r.state == ReqState::Waiting && r.n_computed == 0 &&
-        !running_.empty() && !fresh_fits(s)) {
+        (!running_.empty() || !took_.empty()) && !fresh_fits(s)) {
         if (s.held_us == 0) {
             s.held_us = mono_us();
             ++m_.admit_kv_held;

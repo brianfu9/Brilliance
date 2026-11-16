@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "embed": "tsc -b && vite build && python3 ../tools/dashboard_embed.py write"
+    "embed": "tsc -b && vite build && python3 ../tools/dashboard_embed.py write",
+    "test": "vitest run && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@base-ui/react": "^1.9.0",
@@ -33,6 +34,7 @@
     "oxlint": "^1.90.0",
     "typescript": "~7.0.2",
     "vite": "^8.3.6",
-    "vite-plugin-singlefile": "^2.3.4"
+    "vite-plugin-singlefile": "^2.3.4",
+    "vitest": "^4.1.12"
   }
 }

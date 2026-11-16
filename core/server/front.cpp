@@ -352,6 +352,17 @@ void Front::abandon(const std::string& name) {
     changed_.notify_all();
 }
 
+void Front::clear_failure(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (auto& p : entries_)
+        if (p->name == name && !p->removed && p->state == State::Failed) {
+            p->state = State::Cold;
+            p->why.clear();
+            p->retry_ns = 0;
+        }
+    changed_.notify_all();
+}
+
 void Front::set_parked(const std::string& name, bool parked) {
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& p : entries_)

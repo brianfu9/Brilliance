@@ -41,6 +41,7 @@ const STATES: Record<string, { label: string; tone: string }> = {
   parked: { label: "Parked", tone: "var(--series-1)" },
   cold: { label: "Not loaded", tone: "var(--idle)" },
   failed: { label: "Failed", tone: "var(--bad)" },
+  off: { label: "Off", tone: "var(--idle)" },
 }
 export const stateOf = (s: string | undefined) => STATES[s ?? ""] ?? { label: s || "Unknown", tone: "var(--idle)" }
 /** The state behind a history value of an `s:<id>` column. */

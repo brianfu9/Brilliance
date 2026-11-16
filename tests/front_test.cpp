@@ -590,3 +590,16 @@ TEST(an_upstream_path_is_the_rest_for_that_model) {
     CHECK_EQ(c.path, "/v1/chat/completions");
     CHECK_EQ(Front::requested_model(c), "qwen27b");
 }
+
+/* (local) The dashboard's off switch: a turned-off model is Failed with the switch named, and
+ * turning it on makes it Cold at once (not after the retry time), so the next request loads it. */
+TEST(a_model_turned_on_again_is_cold_at_once) {
+    Front f(TransportOptions{}, 0);
+    f.add("m", {}, 1000, false);
+    f.fail("m", "model 'm' is turned off", 600000);
+    CHECK(f.activity("m").state == Front::State::Failed);
+    f.clear_failure("m");
+    CHECK(f.activity("m").state == Front::State::Cold);
+    f.clear_failure("m");                                  /* a Cold one stays Cold */
+    CHECK(f.activity("m").state == Front::State::Cold);
+}

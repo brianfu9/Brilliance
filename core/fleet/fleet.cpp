@@ -374,6 +374,9 @@ private:
         std::atomic<bool>                  held{ false };
         /* Pinned in the file or held: another model's demand does not move it. */
         bool kept() const { return entry.pin || held.load(); }
+        /* (local) Turned off with the dashboard's switch (/admin/models/<m>/off): not loaded, and a
+         * request for it gets 503 until it is turned on. Kept across restarts (off_file()). */
+        std::atomic<bool>                  off{ false };
         uint64_t                           warm_uses = 0;      /* its uses (leases) when the warm-up began it */
         /* Between its engine's creation and its grant: a load waiting for the bring-up lock that
          * a granting load holds, so never something that grant may wait for. */
@@ -449,6 +452,11 @@ private:
     void   demand(const std::string& name);
     void   post(std::function<void()> f);
     bool   start_op(Model& m, int op);
+    /* (local) The dashboard's off switches, kept in <RADIANCE_HISTORY_DIR>/fleet-off.json (a JSON
+     * array of model names); no directory keeps them in memory only. */
+    std::string off_file() const;
+    void   load_off();
+    void   save_off();
     void   load_op(Model& m);
     void   restore_op(Model& m);
     void   park_op(Model& m, const std::string& why);
@@ -628,6 +636,52 @@ Fleet::Model* Fleet::find(const std::string& name) {
     for (auto& m : models_)
         if (m->entry.name == name) return m.get();
     return nullptr;
+}
+
+std::string Fleet::off_file() const {
+    const char* d = std::getenv("RADIANCE_HISTORY_DIR");
+    if (!d || !*d) return std::string();
+    std::string dir(d);
+    while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\') &&
+           !(dir.size() == 3 && dir[1] == ':'))
+        dir.pop_back();
+    return dir + "/fleet-off.json";
+}
+
+void Fleet::load_off() {
+    const std::string f = off_file();
+    if (f.empty()) return;
+    std::ifstream in(f);
+    if (!in) return;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const json j = json::parse(text, nullptr, false);
+    if (!j.is_array()) return;
+    for (const json& n : j)
+        if (n.is_string())
+            if (Model* m = find(n.get<std::string>())) {
+                m->off.store(true);
+                m->entry.pin = false;
+                m->held.store(false);
+                RAD_INFO("model %s: turned off (the dashboard's switch, %s)", m->entry.name.c_str(), f.c_str());
+            }
+}
+
+void Fleet::save_off() {
+    const std::string f = off_file();
+    if (f.empty()) return;
+    json j = json::array();
+    for (auto& m : models_)
+        if (m->off.load()) j.push_back(m->entry.name);
+    const std::string tmp = f + ".tmp";
+    std::ofstream out(tmp, std::ios::trunc);
+    out << j.dump() << '\n';
+    out.close();
+#if defined(_WIN32)
+    const int renamed = out ? rad::os::rename_replace(tmp, f) : -1;
+#else
+    const int renamed = out ? std::rename(tmp.c_str(), f.c_str()) : -1;
+#endif
+    if (renamed != 0) RAD_WARN("cannot write %s; the off switches last until a restart", f.c_str());
 }
 
 void Fleet::demand(const std::string& name) {
@@ -2242,7 +2296,7 @@ void Fleet::warm_tick() {
             warm_.pop_front();
         }
         Model* m = find(name);
-        if (!m || m->engine || m->entry.pin) continue;
+        if (!m || m->engine || m->entry.pin || m->off.load()) continue;
         /* What it displaces needs no room elsewhere: a parked model's weights leave by an
          * unmap and come back from their container (dev_page_refilled), and its KV cache and
          * transients are dropped. A warm load that still made something unload ends the warm-up
@@ -2597,6 +2651,7 @@ std::string Fleet::describe(const std::string& name) {
         j["priority"] = m.entry.priority;
         j["pinned"] = m.entry.pin;
         if (m.held.load()) j["held"] = true;   /* Brilliance: ?hold=1 */
+        j["off"] = m.off.load();
         j["tp"] = m.entry.cfg.tp;
         if (m.resident || m.parked) {
             j["cards"] = m.cards;
@@ -2822,6 +2877,7 @@ json Fleet::status() {
         /* A model that is not serving and waits for room is shown as waiting, whatever it was
          * doing when the wait began (a load, a return from its park). */
         if (j.contains("waiting_for") && a.state != server::Front::State::Open) j["state"] = "waiting";
+        if (j.value("off", false) && a.state != server::Front::State::Open) j["state"] = "off";
         if (const std::string caps = front_.capabilities(n); !caps.empty()) j["capabilities"] = json::parse(caps, nullptr, false);
         models.push_back(j);
         /* Runtime LoRA: an adapter is a model as far as choosing one goes, and /v1/models lists
@@ -3006,6 +3062,38 @@ void Fleet::add_routes() {
             if (!r.second.empty()) return bad(q, 409, "model '" + name + "': " + r.second);
             return ok({ { "id", name }, { "state", unl ? "cold" : "parked" } });
         }
+        /* (local) The dashboard's switch: off unloads the model and refuses to load it again (a
+         * request gets 503 naming the switch) until on; it unpins it, and it outlives a restart. */
+        if (action == "off" || action == "on") {
+            const bool turn_off = action == "off";
+            const auto r = run_cmd([this, name, turn_off] {
+                Model* m = find(name);
+                if (!m) return std::string("?");
+                m->off.store(turn_off);
+                if (turn_off) { m->entry.pin = false; m->held.store(false); }
+                save_off();
+                if (!turn_off) {
+                    front_.clear_failure(name);
+                    return std::string();
+                }
+                if (!m->engine) {
+                    front_.fail(name, "model '" + name + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
+                    return std::string();
+                }
+                for (int i = 0; i < 6000 && m->op.load() != kIdle; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                int expect = kIdle;
+                if (!m->op.compare_exchange_strong(expect, kUnload)) return std::string("busy");
+                unload(*m, fc_.drain_timeout_ms, "turned off with the dashboard's switch");
+                m->op.store(kIdle);
+                front_.fail(name, "model '" + name + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
+                return std::string();
+            }, fc_.drain_timeout_ms + 120000);
+            if (!r.first)
+                return server::HttpResponse::json_body(202, json({ { "id", name }, { "off", turn_off } }).dump());
+            if (!r.second.empty()) return bad(q, 409, "model '" + name + "': " + r.second);
+            return ok({ { "id", name }, { "off", turn_off } });
+        }
         if (action == "pin" || action == "unpin") {
             const bool pin = action == "pin";
             run_cmd([this, name, pin] {
@@ -3016,7 +3104,7 @@ void Fleet::add_routes() {
             if (pin) demand(name);
             return ok({ { "id", name }, { "pinned", pin } });
         }
-        return bad(q, 404, "no admin action '" + action + "'; load, park, unload, pin or unpin");
+        return bad(q, 404, "no admin action '" + action + "'; load, park, unload, pin, unpin, off or on");
     });
     /* Brilliance (fast-loop): ?warm=only refuses (409, nothing changed) a file whose changes would
      * unload a model; the answer's `models` says per model what was retuned in place and what
@@ -3127,6 +3215,10 @@ void Fleet::loop() {
             Model* m = find(n);
             if (!m) continue;
             if (m->engine && !m->parked) continue;   /* serving already */
+            if (m->off.load()) {                     /* (local) the dashboard's switch */
+                front_.fail(n, "model '" + n + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
+                continue;
+            }
             /* Every model's work runs on its own worker: a restore never waits behind a load. */
             if (!start_op(*m, m->engine && m->parked ? kRestore : kLoad)) waiting.push_back(n);
         }
@@ -3304,22 +3396,24 @@ int Fleet::run() {
     }
     sweep_buffers_keep(fc_.models.size() > 1);
 
-    size_t up = 0, planned = 0;
+    load_off();
+    size_t up = 0, planned = 0, off = 0;
     for (const std::string& n : preload) {
         if (g_stop.load()) break;
         Model* m = find(n);
         if (!m) continue;
+        if (m->off.load()) { ++off; RAD_INFO("model %s: turned off, not loaded", n.c_str()); continue; }
         m->op.store(kLoad);
         load_op(*m);
         m->op.store(kIdle);
         if (m->engine) ++up;
         else if (m->planned.load()) ++planned;
     }
-    if (g_stop.load() || (!preload.empty() && up == 0)) {
+    if (g_stop.load() || (!preload.empty() && up == 0 && (planned > 0 || off < preload.size()))) {
         /* Brilliance (rc-fixes): every model the start needed stopped at --plan-only with its
          * plan admitted: the mode did what it was asked, so the process exits 0. A refused plan,
          * or any model that failed beside it, still ends with the E line and 1. */
-        const bool all_planned = !g_stop.load() && planned == preload.size();
+        const bool all_planned = !g_stop.load() && planned > 0 && planned + off == preload.size();
         if (all_planned) RAD_INFO("--plan-only: every model's plan was admitted; nothing was loaded");
         else if (!g_stop.load()) RAD_ERR("no model started");
         stop_all();

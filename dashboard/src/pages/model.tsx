@@ -1,5 +1,6 @@
 // One model: what it is and how it is doing, in four views under Monitoring, and a Sandbox to try it.
 import { Empty, StateBadge } from "@/components/bits"
+import { ModelSwitch } from "@/components/model-switch"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import type { FleetModel } from "@/lib/api"
 import { fBytes, fDur } from "@/lib/format"
@@ -37,11 +38,12 @@ export function ModelPage({ id, tab, model, models, local }: { id: string; tab: 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <h1 className="text-xl font-semibold tracking-tight">{id}</h1>
           <StateBadge state={model?.state} doing={model?.doing} />
+          {local && model && <ModelSwitch id={id} off={!!model.off} label />}
           <span className="text-sm text-muted-foreground">
             {[model?.file, where, model?.state === "resident" && model.vram_bytes_per_card ? fBytes(model.vram_bytes_per_card) + " per accelerator" : null, s?.uptime_s ? "up " + fDur(s.uptime_s) : null].filter(Boolean).join(" · ")}
           </span>
         </div>
-        {model?.error && <div className="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-sm">{model.error}</div>}
+        {model?.error && !model.off && <div className="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-sm">{model.error}</div>}
         <Tabs value={sandbox ? "sandbox" : "monitoring"} onValueChange={(v) => { location.hash = hrefOf(id, v === "sandbox" ? "sandbox" : "performance") }}>
           <TabsList><TabsTrigger value="monitoring" className="px-3">Monitoring</TabsTrigger><TabsTrigger value="sandbox" className="px-3">Sandbox</TabsTrigger></TabsList>
         </Tabs>

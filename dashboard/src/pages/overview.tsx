@@ -1,5 +1,6 @@
 // The fleet: what is on each card, what every model is doing, and how that moved over the window.
 import { useMemo } from "react"
+import { ModelSwitch } from "@/components/model-switch"
 import { Chart, Legend, type Line } from "@/components/chart"
 import { Empty, Kpi, Panel, PartBar, PartLegend, StateBadge, StateDot, STATE_OF_CODE, stateOf, type Part } from "@/components/bits"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
@@ -87,6 +88,7 @@ export function Overview() {
           <TableHeader>
             <TableRow className="hover:bg-transparent">
               <TableHead className="pl-4">Model</TableHead>
+              <TableHead>On</TableHead>
               <TableHead>State</TableHead>
               <TableHead className="text-right">Priority</TableHead>
               <TableHead>Accelerators</TableHead>
@@ -106,8 +108,9 @@ export function Overview() {
                     <i className="size-2 rounded-full" style={{ background: hueOf.get(m.id) }} />
                     {m.id}
                   </a>
-                  <div className="mt-0.5 max-w-72 truncate pl-4 text-xs text-muted-foreground">{m.error ?? m.file}</div>
+                  <div className="mt-0.5 max-w-72 truncate pl-4 text-xs text-muted-foreground">{(!m.off && m.error) || m.file}</div>
                 </TableCell>
+                <TableCell><ModelSwitch id={m.id} off={!!m.off} /></TableCell>
                 <TableCell><StateBadge state={m.state} doing={m.doing} /></TableCell>
                 <TableCell className="num text-right">{fNum(m.priority)}{m.pinned ? " · pinned" : ""}</TableCell>
                 <TableCell className="num text-muted-foreground">{m.cards?.length ? m.cards.join(", ") : "–"}</TableCell>

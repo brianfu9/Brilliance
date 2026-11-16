@@ -25,6 +25,8 @@ export interface FleetModel {
   vram_bytes_by_card?: Record<string, number>
   host_bytes?: number; host_pinned_bytes?: number; drive_bytes?: number; last_restore_s?: number; load_s?: number
   doing?: string; waiting_for?: string; error?: string; warm?: boolean; in_place?: boolean
+  /** (local) Turned off with the dashboard's switch. */
+  off?: boolean
   park?: { ram?: string; restore?: string; vram?: string }
   capabilities?: Record<string, unknown>
   [k: string]: unknown

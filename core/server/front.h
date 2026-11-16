@@ -119,6 +119,9 @@ public:
     /* A load nobody asked for gave up (the fleet's warm-up): a loading model is cold again, and
      * any request that came meanwhile asks for it anew. */
     void abandon(const std::string& name);
+    /* (local) A Failed model is Cold again at once (its `why` cleared): the dashboard's switch
+     * turned it back on, so the next request loads it. */
+    void clear_failure(const std::string& name);
     /* A Cold model is parked (its memory waits in host RAM), or no longer is. */
     void set_parked(const std::string& name, bool parked);
     /* The load failed: requests waiting get `why` as a 503, and so do new ones until `retry_ms`

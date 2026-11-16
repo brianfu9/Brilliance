@@ -189,6 +189,9 @@ public:
     bool caller_is_operator(const HttpRequest& q) const {
         return !q.missing_key && (!operator_rule_ || operator_rule_(q));
     }
+    /* Local patch 0031: llama-swap's /upstream/<model>/<rest> is <rest> for <model>,
+     * named in the query as a dashboard read names it. */
+    static void upstream_rewrite(HttpRequest& q, const std::string& model, const std::string& rest);
 
 private:
     struct Entry {

@@ -573,3 +573,20 @@ TEST(a_bare_ping_on_one_model_reads_the_process_and_never_loads_it) {
 }
 
 RAD_TEST_MAIN()
+
+/* Local patch 0031: llama-swap's /upstream/<model>/<rest>. */
+TEST(an_upstream_path_is_the_rest_for_that_model) {
+    HttpRequest q;
+    q.method = "GET";
+    q.path = "/upstream/rad/stats";
+    Front::upstream_rewrite(q, "rad", "stats");
+    CHECK_EQ(q.path, "/stats");
+    CHECK_EQ(Front::requested_model(q), "rad");
+    CHECK(Front::dashboard_read(q));
+    HttpRequest c;
+    c.method = "POST";
+    c.body = R"({"model":"other"})";
+    Front::upstream_rewrite(c, "qwen27b", "v1/chat/completions");
+    CHECK_EQ(c.path, "/v1/chat/completions");
+    CHECK_EQ(Front::requested_model(c), "qwen27b");
+}

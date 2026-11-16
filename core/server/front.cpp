@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 
@@ -139,6 +140,11 @@ std::string Front::requested_model(const HttpRequest& q) {
     return std::string();
 }
 
+void Front::upstream_rewrite(HttpRequest& q, const std::string& model, const std::string& rest) {
+    q.path = "/" + rest;
+    q.query["model"] = model;
+}
+
 /* ------------------------------------------------------------------ metrics */
 
 std::string merge_metrics(const std::vector<std::string>& texts) {
@@ -268,6 +274,26 @@ void Front::install_routes(const Router& model_router) {
     router_.get("/terms/licenses", [](const HttpRequest&) { return licence_page(""); });
     router_.get("/terms/licenses/:id",
                 [](const HttpRequest& q) { return licence_page(q.param("id", "?")); });
+    /* Local patch 0031: llama-swap's /upstream/<model>/<path>, so the scripts and links
+     * that read a model through llama-swap keep working on the same port. The model's own page
+     * is the fleet's dashboard. A dashboard read through it still does not bring a model back. */
+    auto to_dashboard = [](const HttpRequest&) {
+        HttpResponse r;
+        r.status = 302;
+        r.content_type = "text/plain";
+        r.set_header("Location", "/");
+        return r;
+    };
+    router_.get("/upstream/:model", to_dashboard);
+    for (const char* m : { "GET", "POST", "DELETE" })
+        router_.add(m, "/upstream/:model/*rest", [this, to_dashboard](const HttpRequest& q0) {
+            const std::string rest = q0.param("rest");
+            if (rest.empty() || rest == "dashboard") return to_dashboard(q0);
+            if (rest == "ping") return model_health(q0, q0.param("model"));
+            HttpRequest q = q0;
+            upstream_rewrite(q, q0.param("model"), rest);
+            return forward(std::move(q));
+        });
     for (const std::string& path : model_router.socket_routes())
         router_.socket(path, [this](const HttpRequest& q, WsConn& c) { forward_socket(q, c); });
 }

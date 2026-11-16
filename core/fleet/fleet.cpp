@@ -3019,6 +3019,74 @@ void Fleet::add_routes() {
             return bad(q, r.second.rfind("warm only:", 0) == 0 ? 409 : 400, "reload refused: " + r.second);
         return ok({ { "reloaded", fc_.path }, { "models", *rep } });
     });
+
+    /* Local patch 0031: llama-swap's routes, so the clients that called llama-swap on this
+     * port (Home Assistant's sensor and unload, rad-mode-watch.ps1, the window scripts) keep
+     * working unchanged. Guarded as the routes above. A name may be an alias. */
+    auto canon = [this](const std::string& n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& m : models_) {
+            if (m->entry.name == n) return n;
+            for (const std::string& a : m->entry.aliases)
+                if (a == n) return m->entry.name;
+        }
+        return std::string();
+    };
+    auto unload_one = [this, run_cmd](const std::string& name) -> std::pair<int, std::string> {
+        const auto r = run_cmd([this, name] {
+            Model* m = find(name);
+            if (!m || !m->engine) return std::string();
+            if (m->entry.pin) return std::string("pinned");
+            for (int i = 0; i < 6000 && m->op.load() != kIdle; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            int expect = kIdle;
+            if (!m->op.compare_exchange_strong(expect, kUnload)) return std::string("busy");
+            unload(*m, fc_.drain_timeout_ms, "asked by a llama-swap compatibility route");
+            m->op.store(kIdle);
+            return std::string();
+        }, fc_.drain_timeout_ms + 120000);
+        if (!r.first) return { 202, "unloading" };
+        if (!r.second.empty()) return { 409, r.second };
+        return { 200, "cold" };
+    };
+    front_.route("GET", "/running", [this, guard, ok](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        json run = json::array();
+        for (const std::string& n : front_.names()) {
+            const char* st = nullptr;
+            switch (front_.activity(n).state) {
+            case server::Front::State::Open:    st = "ready"; break;
+            case server::Front::State::Loading: st = "starting"; break;
+            case server::Front::State::Closing: st = "stopping"; break;
+            case server::Front::State::Parked:  st = "parked"; break;
+            default: break;
+            }
+            if (st) run.push_back({ { "model", n }, { "state", st } });
+        }
+        return ok(json{ { "running", run } });
+    });
+    auto unload_all = [this, guard, ok, unload_one](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        json done = json::array();
+        for (const std::string& n : front_.names()) {
+            const server::Front::State st = front_.activity(n).state;
+            if (st == server::Front::State::Cold || st == server::Front::State::Failed) continue;
+            const auto r = unload_one(n);
+            done.push_back({ { "model", n }, { "status", r.first }, { "state", r.second } });
+        }
+        return ok(json{ { "unloaded", done } });
+    };
+    front_.route("GET", "/unload", unload_all);
+    front_.route("POST", "/unload", unload_all);
+    front_.route("POST", "/api/models/unload", unload_all);
+    front_.route("POST", "/api/models/unload/:name", [guard, ok, bad, canon, unload_one](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        const std::string name = canon(q.param("name"));
+        if (name.empty()) return bad(q, 404, "no model '" + q.param("name") + "' is configured");
+        const auto r = unload_one(name);
+        if (r.first == 409) return bad(q, 409, "model '" + name + "': " + r.second);
+        return server::HttpResponse::json_body(r.first, json({ { "id", name }, { "state", r.second } }).dump());
+    });
 }
 
 void Fleet::loop() {

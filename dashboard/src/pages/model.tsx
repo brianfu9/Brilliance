@@ -1,6 +1,7 @@
 // One model: what it is and how it is doing, in four views under Monitoring, and a Sandbox to try it.
 import { Empty, StateBadge } from "@/components/bits"
 import { ModelSwitch } from "@/components/model-switch"
+import { ModelLoad } from "@/components/model-load"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import type { FleetModel } from "@/lib/api"
 import { fBytes, fDur } from "@/lib/format"
@@ -39,6 +40,7 @@ export function ModelPage({ id, tab, model, models, local }: { id: string; tab: 
           <h1 className="text-xl font-semibold tracking-tight">{id}</h1>
           <StateBadge state={model?.state} doing={model?.doing} />
           {local && model && <ModelSwitch id={id} off={!!model.off} label />}
+          {local && model && <ModelLoad id={id} state={model.state} off={!!model.off} />}
           <span className="text-sm text-muted-foreground">
             {[model?.file, where, model?.state === "resident" && model.vram_bytes_per_card ? fBytes(model.vram_bytes_per_card) + " per accelerator" : null, s?.uptime_s ? "up " + fDur(s.uptime_s) : null].filter(Boolean).join(" · ")}
           </span>

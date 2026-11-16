@@ -39,6 +39,15 @@ struct StatsScheduler : FakeScheduler {
         r.ttft_s = 0.25;
         r.prefill_s = 0.20;
         r.decode_tps = 61.0;
+        /* (local) The queue view's members, which /stats emits only while they apply (a tag
+         * given, a place in the queue, a hold, an admission need): set here so the page-reads
+         * check sees each one. */
+        r.tag = "t-41";
+        r.priority = 1;
+        r.queue_pos = 0;
+        r.wait = "kv_hold";
+        r.held_s = 1.5;
+        r.admit_tokens = 2048;
         out->assign(1, r);
         return 1;
     }

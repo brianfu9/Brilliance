@@ -8,6 +8,7 @@ import type { Fleet, FleetModel } from "@/lib/api"
 import { bytesParts, fBytes, fClock, fDur, fin, fNum } from "@/lib/format"
 import { fleet as fleetScope, useScope, type Series } from "@/lib/store"
 import { hrefOf, useRange } from "@/lib/ui"
+import { RangeToggle } from "@/components/range"
 
 const hue = (i: number) => `var(--series-${(i % 8) + 1})`
 // What a model holds on one accelerator: the server's figure for it in any state, so a model that
@@ -66,6 +67,11 @@ export function Overview() {
         <Kpi label="Restores" value={fNum(returns)} detail={cold.length ? `${cold.length} not loaded` : "from parked to loaded"} />
         <Kpi label="Power draw" value={noPower ? "n/a" : power > 0 ? fNum(power) : "–"} unit={!noPower && power > 0 ? "W" : undefined}
           detail={noPower ? UNREPORTED : somePower < f.cards.length && somePower > 0 ? `across ${somePower} of ${f.cards.length} accelerators` : `across ${f.cards.length} accelerator${f.cards.length === 1 ? "" : "s"}`} />
+      </div>
+
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Time range of the charts below</span>
+        <RangeToggle className="ml-auto" />
       </div>
 
       <div className="grid gap-3 xl:grid-cols-2">

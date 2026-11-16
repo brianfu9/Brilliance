@@ -7,6 +7,7 @@ import type { Experts, Stats } from "@/lib/api"
 import { DASH, bytesParts, fBytes, fDur, fNum, fPct, fRate, fSig, fin } from "@/lib/format"
 import type { Scope, Series } from "@/lib/store"
 import { useRange } from "@/lib/ui"
+import { RangeToggle } from "@/components/range"
 import { cn } from "@/lib/utils"
 
 export type Kind = "chat" | "embed" | "gen"
@@ -81,7 +82,10 @@ export function Performance({ scope, kind, slots, noun }: { scope: Scope<Stats>;
           })}
         </div>
         <div className="flex flex-col gap-2 p-4">
-          {metric.lines.length > 1 && <Legend lines={metric.lines} />}
+          <div className="flex flex-wrap items-center gap-2">
+            {metric.lines.length > 1 && <Legend lines={metric.lines} />}
+            <RangeToggle className="ml-auto" />
+          </div>
           <Chart key={metric.id} data={h} version={scope.version} lines={metric.lines} range={range} fmt={metric.fmt} height={300}
             stack={metric.stack} max={metric.max} tight={metric.tight} integer={metric.integer} bytes={metric.bytes} join={metric.join} />
         </div>

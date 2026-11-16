@@ -1,5 +1,6 @@
 // The shell: the models down the side, the chosen view beside them, and the controls that apply
-// to every view (the charts' window, the theme, the key of a server that asks for one).
+// to every view (the theme, the key of a server that asks for one). The time charts' window is chosen
+// on the pages that have them (components/range.tsx).
 import { useEffect, useState } from "react"
 import { KeyRound, LayoutDashboard, Moon, Sun } from "lucide-react"
 import { Logo } from "@/components/logo"
@@ -8,20 +9,18 @@ import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuBadge, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar"
-import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { auth, type FleetModel } from "@/lib/api"
 import { useFetched } from "@/lib/fetched"
 import { fDur } from "@/lib/format"
 import { fleet, useScope } from "@/lib/store"
-import { RANGES, hrefOf, setRange, setTheme, useRange, useRoute, useTheme } from "@/lib/ui"
+import { hrefOf, setTheme, useRoute, useTheme } from "@/lib/ui"
 import { ModelPage } from "@/pages/model"
 import { Overview } from "@/pages/overview"
 
 export default function App() {
   const scope = useScope(fleet)
   const route = useRoute()
-  const range = useRange()
   const theme = useTheme()
   const f = scope.live
   // A server without a key shows its fleet to its own machine only. From elsewhere the models come
@@ -97,9 +96,6 @@ export default function App() {
             <SidebarTrigger className="-ml-1" />
             <span className="truncate text-sm font-medium">{shown ?? "Overview"}</span>
             <div className="ml-auto flex items-center gap-1.5">
-              <ToggleGroup value={[String(range)]} onValueChange={(v) => { if (v.length) setRange(Number(v[v.length - 1])) }} variant="outline" size="sm" aria-label="Time range">
-                {RANGES.map(([s, label]) => <ToggleGroupItem key={s} value={String(s)} className="num px-2.5 text-xs">{label}</ToggleGroupItem>)}
-              </ToggleGroup>
               <Button variant="ghost" size="icon-sm" aria-label="Switch theme" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}</Button>
             </div>
           </header>

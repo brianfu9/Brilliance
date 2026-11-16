@@ -38,6 +38,8 @@ export interface FleetCard {
 }
 export interface Fleet {
   version: string; uptime_s: number
+  /** (local) Every model paused (POST /admin/pause): until a unix second, or null until resumed. */
+  paused?: { until: number | null } | null
   models: FleetModel[]; cards: FleetCard[]
   groups: { name: string; kind: string; members: string[] }[]
   host: { budget_bytes?: number; copies_bytes?: number; held_bytes?: number; disk_tier?: string }

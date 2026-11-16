@@ -26,6 +26,7 @@
 #include <csignal>
 #include <deque>
 #include <filesystem>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -377,6 +378,9 @@ private:
         /* (local) Turned off with the dashboard's switch (/admin/models/<m>/off): not loaded, and a
          * request for it gets 503 until it is turned on. Kept across restarts (off_file()). */
         std::atomic<bool>                  off{ false };
+        /* (local) Off because of a pause (POST /admin/pause), so a resume turns it back on; a model
+         * turned off by hand is not. */
+        std::atomic<bool>                  paused{ false };
         uint64_t                           warm_uses = 0;      /* its uses (leases) when the warm-up began it */
         /* Between its engine's creation and its grant: a load waiting for the bring-up lock that
          * a granting load holds, so never something that grant may wait for. */
@@ -457,6 +461,15 @@ private:
     std::string off_file() const;
     void   load_off();
     void   save_off();
+    /* (local) Scheduler thread: turn one model off (unpin, unload, refuse) or on. "" or why not. */
+    std::string switch_off(Model& m);
+    void   switch_on(Model& m);
+    bool   off_named(const std::string& name);
+    std::string off_why(const std::string& name);
+    void   resume_all(const char* why);
+    /* (local) A pause of every model: since, and until (unix s; 0 = until resumed). Under mu_. */
+    bool    paused_ = false;
+    int64_t pause_until_ = 0;
     void   load_op(Model& m);
     void   restore_op(Model& m);
     void   park_op(Model& m, const std::string& why);
@@ -655,23 +668,44 @@ void Fleet::load_off() {
     if (!in) return;
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     const json j = json::parse(text, nullptr, false);
-    if (!j.is_array()) return;
-    for (const json& n : j)
-        if (n.is_string())
-            if (Model* m = find(n.get<std::string>())) {
-                m->off.store(true);
-                m->entry.pin = false;
-                m->held.store(false);
-                RAD_INFO("model %s: turned off (the dashboard's switch, %s)", m->entry.name.c_str(), f.c_str());
-            }
+    /* 0042 wrote a bare array of names; now {"off": [...], "paused": [...], "pause": bool, "until": s}. */
+    const json off = j.is_array() ? j : (j.is_object() && j.contains("off") ? j["off"] : json::array());
+    const json paused = j.is_object() && j.contains("paused") ? j["paused"] : json::array();
+    auto mark = [&](const json& list, bool by_pause) {
+        if (!list.is_array()) return;
+        for (const json& n : list)
+            if (n.is_string())
+                if (Model* m = find(n.get<std::string>())) {
+                    m->off.store(true);
+                    m->paused.store(by_pause);
+                    m->entry.pin = false;
+                    m->held.store(false);
+                    RAD_INFO("model %s: %s (%s)", m->entry.name.c_str(), by_pause ? "paused" : "turned off", f.c_str());
+                }
+    };
+    mark(off, false);
+    mark(paused, true);
+    if (j.is_object() && j.value("pause", false)) {
+        std::lock_guard<std::mutex> lk(mu_);
+        paused_ = true;
+        pause_until_ = j.value("until", (int64_t)0);
+    }
 }
 
 void Fleet::save_off() {
     const std::string f = off_file();
     if (f.empty()) return;
-    json j = json::array();
+    json off = json::array(), paused = json::array();
     for (auto& m : models_)
-        if (m->off.load()) j.push_back(m->entry.name);
+        if (m->off.load()) (m->paused.load() ? paused : off).push_back(m->entry.name);
+    json j;
+    j["off"] = off;
+    j["paused"] = paused;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        j["pause"] = paused_;
+        j["until"] = pause_until_;
+    }
     const std::string tmp = f + ".tmp";
     std::ofstream out(tmp, std::ios::trunc);
     out << j.dump() << '\n';
@@ -682,6 +716,60 @@ void Fleet::save_off() {
     const int renamed = out ? std::rename(tmp.c_str(), f.c_str()) : -1;
 #endif
     if (renamed != 0) RAD_WARN("cannot write %s; the off switches last until a restart", f.c_str());
+}
+
+bool Fleet::off_named(const std::string& name) {
+    Model* m = find(name);
+    return m && m->off.load();
+}
+
+std::string Fleet::off_why(const std::string& name) {
+    Model* m = find(name);
+    if (m && m->paused.load()) {
+        int64_t until;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            until = pause_until_;
+        }
+        const int64_t left = until > 0 ? until - (int64_t)std::time(nullptr) : -1;
+        return "model '" + name + "' is paused (the dashboard's pause)" +
+               (left > 0 ? ", for " + std::to_string((left + 59) / 60) + " more minute(s)" : std::string(" until it is resumed"));
+    }
+    return "model '" + name + "' is turned off (the dashboard's switch); turn it on to load it";
+}
+
+std::string Fleet::switch_off(Model& m) {
+    m.off.store(true);
+    m.entry.pin = false;
+    m.held.store(false);
+    if (m.engine) {
+        for (int i = 0; i < 6000 && m.op.load() != kIdle; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        int expect = kIdle;
+        if (!m.op.compare_exchange_strong(expect, kUnload)) return "busy";
+        unload(m, fc_.drain_timeout_ms, m.paused.load() ? "paused" : "turned off with the dashboard's switch");
+        m.op.store(kIdle);
+    }
+    front_.fail(m.entry.name, off_why(m.entry.name), 15000);
+    return "";
+}
+
+void Fleet::switch_on(Model& m) {
+    m.off.store(false);
+    m.paused.store(false);
+    front_.clear_failure(m.entry.name);
+}
+
+void Fleet::resume_all(const char* why) {
+    for (auto& m : models_)
+        if (m->paused.load()) switch_on(*m);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        paused_ = false;
+        pause_until_ = 0;
+    }
+    save_off();
+    RAD_INFO("resumed (%s)", why);
 }
 
 void Fleet::demand(const std::string& name) {
@@ -2635,8 +2723,24 @@ std::string Fleet::reload(bool warm_only, json* report) {
     }
     fc_ = std::move(nf);
     dev_stuck_exit_ms.store(fc_.stuck_exit_ms, std::memory_order_relaxed);
+    /* (local) The fleet's headroom follows the file too (the constructor's rule): the local VRAM
+     * mode changes by a reload, not a restart. A model whose headroom changed was unloaded above
+     * (its configuration changed), so the next load uses the new figure on both levels. */
+    {
+        bool any = false;
+        int64_t head = 0;
+        for (const ModelEntry& e : fc_.models)
+            if (!e.cfg.given.count("--gpu-memory-mib")) {
+                head = std::max(head, e.cfg.gpu_headroom_mib * kMiB);
+                any = true;
+            }
+        const int64_t was = headroom_;
+        headroom_ = any ? head : 96 * kMiB;
+        if (headroom_ != was)
+            RAD_INFO("reload: VRAM headroom %lld -> %lld MiB", (long long)(was / kMiB), (long long)(headroom_ / kMiB));
+    }
     for (const ModelEntry& e : fc_.models)
-        if (e.pin) demand(e.name);
+        if (e.pin && !off_named(e.name)) demand(e.name);
     RAD_INFO("reload: %s applied, %zu model(s)", fc_.path.c_str(), fc_.models.size());
     if (report) *report = rep;
     return "";
@@ -2935,7 +3039,12 @@ json Fleet::status() {
             if (m->engine && m->parked && m->filled >= 0) fill += dev_page_fillable(m->engine->owner());
         warm["drive_only_bytes"] = fill;
     }
-    return json{ { "version", RAD_VERSION }, { "uptime_s", secs_since(started_) }, { "models", models },
+    json pause = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (paused_) pause = { { "until", pause_until_ ? json(pause_until_) : json(nullptr) } };
+    }
+    return json{ { "version", RAD_VERSION }, { "uptime_s", secs_since(started_) }, { "paused", pause }, { "models", models },
                 { "cards", cards }, { "groups", groups }, { "host", host }, { "warm_up", warm } };
 }
 
@@ -3069,25 +3178,15 @@ void Fleet::add_routes() {
             const auto r = run_cmd([this, name, turn_off] {
                 Model* m = find(name);
                 if (!m) return std::string("?");
-                m->off.store(turn_off);
-                if (turn_off) { m->entry.pin = false; m->held.store(false); }
+                std::string res;
+                if (turn_off) {
+                    m->paused.store(false);        /* off by hand: a resume leaves it off */
+                    res = switch_off(*m);
+                } else {
+                    switch_on(*m);
+                }
                 save_off();
-                if (!turn_off) {
-                    front_.clear_failure(name);
-                    return std::string();
-                }
-                if (!m->engine) {
-                    front_.fail(name, "model '" + name + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
-                    return std::string();
-                }
-                for (int i = 0; i < 6000 && m->op.load() != kIdle; ++i)
-                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                int expect = kIdle;
-                if (!m->op.compare_exchange_strong(expect, kUnload)) return std::string("busy");
-                unload(*m, fc_.drain_timeout_ms, "turned off with the dashboard's switch");
-                m->op.store(kIdle);
-                front_.fail(name, "model '" + name + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
-                return std::string();
+                return res;
             }, fc_.drain_timeout_ms + 120000);
             if (!r.first)
                 return server::HttpResponse::json_body(202, json({ { "id", name }, { "off", turn_off } }).dump());
@@ -3105,6 +3204,44 @@ void Fleet::add_routes() {
             return ok({ { "id", name }, { "pinned", pin } });
         }
         return bad(q, 404, "no admin action '" + action + "'; load, park, unload, pin, unpin, off or on");
+    });
+    /* (local) Pause every model (the dashboard's Pause; fleet-pause.sh): each one not already off is
+     * turned off as by its switch, and a resume (POST /admin/resume, or the end of `minutes`) turns
+     * those back on. The process, its page, /history and the request log stay up. */
+    front_.route("POST", "/admin/pause", [this, guard, ok, bad, run_cmd](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        int64_t until = 0;
+        if (auto it = q.query.find("minutes"); it != q.query.end()) {
+            const double mins = std::strtod(it->second.c_str(), nullptr);
+            if (!(mins > 0) || mins > 7 * 24 * 60) return bad(q, 400, "minutes: a number from 0 to 10080");
+            until = (int64_t)std::time(nullptr) + (int64_t)std::llround(mins * 60);
+        }
+        const auto r = run_cmd([this, until] {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                paused_ = true;
+                pause_until_ = until;
+            }
+            std::string res;
+            for (auto& m : models_)
+                if (!m->off.load()) {
+                    m->paused.store(true);
+                    const std::string e = switch_off(*m);
+                    if (!e.empty()) res += m->entry.name + ": " + e + "; ";
+                }
+            save_off();
+            RAD_INFO("paused %s", until ? ("until " + std::to_string(until)).c_str() : "until resumed");
+            return res;
+        }, fc_.drain_timeout_ms + 180000);
+        json j = { { "paused", true }, { "until", until ? json(until) : json(nullptr) } };
+        if (!r.first) return server::HttpResponse::json_body(202, j.dump());
+        if (!r.second.empty()) j["errors"] = r.second;
+        return ok(j);
+    });
+    front_.route("POST", "/admin/resume", [this, guard, ok, run_cmd](const server::HttpRequest& q) {
+        if (auto g = guard(q)) return *g;
+        run_cmd([this] { resume_all("asked"); return std::string(); }, 60000);
+        return ok({ { "paused", false } });
     });
     /* Brilliance (fast-loop): ?warm=only refuses (409, nothing changed) a file whose changes would
      * unload a model; the answer's `models` says per model what was retuned in place and what
@@ -3216,7 +3353,7 @@ void Fleet::loop() {
             if (!m) continue;
             if (m->engine && !m->parked) continue;   /* serving already */
             if (m->off.load()) {                     /* (local) the dashboard's switch */
-                front_.fail(n, "model '" + n + "' is turned off (the dashboard's switch); turn it on to load it", 15000);
+                front_.fail(n, off_why(n), 15000);
                 continue;
             }
             /* Every model's work runs on its own worker: a restore never waits behind a load. */
@@ -3226,6 +3363,14 @@ void Fleet::loop() {
             if (m->op.load() == kIdle && m->worker.joinable()) m->worker.join();
         reap();
         ttl_tick();
+        {
+            bool due;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                due = paused_ && pause_until_ > 0 && (int64_t)std::time(nullptr) >= pause_until_;
+            }
+            if (due) resume_all("the pause ended");
+        }
         /* A request for a warm model makes it an ordinary one. */
         for (auto& m : models_)
             if (m->warm.load()) {

@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react"
 import { KeyRound, LayoutDashboard, Moon, Sun } from "lucide-react"
 import { Logo } from "@/components/logo"
+import { PauseBanner, PauseMenu } from "@/components/pause"
 import { StateDot, stateOf } from "@/components/bits"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -96,9 +97,11 @@ export default function App() {
             <SidebarTrigger className="-ml-1" />
             <span className="truncate text-sm font-medium">{shown ?? "Overview"}</span>
             <div className="ml-auto flex items-center gap-1.5">
+              {f && !scope.refused && <PauseMenu paused={!!f.paused} />}
               <Button variant="ghost" size="icon-sm" aria-label="Switch theme" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}</Button>
             </div>
           </header>
+          {f?.paused && <PauseBanner until={f.paused.until} />}
           <main className="min-w-0">
             {shown !== null ? <ModelPage key={shown} id={shown} tab={route.tab} model={model} models={models} local={!scope.refused} />
               : scope.refused ? (

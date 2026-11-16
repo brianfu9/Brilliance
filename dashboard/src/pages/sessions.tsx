@@ -5,9 +5,20 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { withModel, type Session, type Sessions } from "@/lib/api"
 import { bytesParts, fBytes, fDur, fNum } from "@/lib/format"
 import { useFetched } from "@/lib/fetched"
+import { useMemo } from "react"
+import { KvPoolBar } from "@/components/activity/KvPoolBar"
+import { snapshotOf } from "@/lib/activity/queue"
+import { SlotAssigner, requestKey, runningRequests } from "@/lib/activity/queueView"
+import { modelScope, useScope } from "@/lib/store"
 
 export function SessionsView({ model }: { model: string }) {
   const { data: s, error } = useFetched<Sessions>(withModel("sessions", model), 5000)
+  // The KV pool these conversations' cache lives in, drawn as the queue view draws it (from the
+  // model's live /stats, five times a second), so the cached part is seen beside what is running.
+  const scope = useScope(modelScope(model))
+  const snap = snapshotOf(model, scope.live, Date.now())
+  const assigner = useMemo(() => new SlotAssigner(4), [])
+  const slots = snap ? assigner.assign(runningRequests(snap).map((r) => requestKey(snap.model, r))) : new Map<string, number>()
   if (!s) return <Empty>{error ?? "Loading"}</Empty>
   const list = (s.sessions ?? []).slice().sort((a, b) => a.idle_s - b.idle_s)
   const linear = (s.linear?.checkpoints_written ?? 0) > 0 || list.some((r) => r.snapshots > 0)
@@ -18,6 +29,7 @@ export function SessionsView({ model }: { model: string }) {
   const [hv, hu] = bytesParts(s.occupancy?.host_bytes)
   return (
     <div className="flex flex-col gap-4">
+      {snap && <Panel title="KV pool" description="Held by running requests, reserved for their output, cached for returning conversations, and free"><KvPoolBar snapshot={snap} slots={slots} /></Panel>}
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Kpi label="Resumable" value={fNum(live.length)} detail={cold.length ? `${cold.length} will restart` : "cached conversations"} />
         <Kpi label="Tokens cached" value={fNum(s.pool?.tokens_used)} detail={s.pool ? `of ${fNum(s.pool.tokens_total)}` : ""} />

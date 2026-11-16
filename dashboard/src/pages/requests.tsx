@@ -10,6 +10,8 @@ import { useMemo } from "react"
 import { ActivityStats } from "@/components/activity/ActivityStats"
 import { buildStats, toEntry } from "@/lib/activity/records"
 import { ActivityTable } from "@/components/activity/ActivityTable"
+import { QueuePanel } from "@/components/activity/QueuePanel"
+import { snapshotOf } from "@/lib/activity/queue"
 import { Button } from "@/components/ui/button"
 import { Download } from "lucide-react"
 
@@ -42,6 +44,7 @@ export function Requests({ id, scope }: { id: string; scope: Scope<Stats> }) {
         <Kpi label="Median time to first token" value={ttfts.length ? fDur(median(ttfts)) : DASH} detail={`over ${fNum(ttfts.length)} kept`} />
       </div>
       <ActivityStats stats={stats} />
+      <QueuePanel snapshot={snapshotOf(id, s, Date.now())} storagePrefix="radiance-requests" />
       <Panel title="Time to first token" description="Distribution across the kept requests">
         <Histogram values={ttfts} />
       </Panel>

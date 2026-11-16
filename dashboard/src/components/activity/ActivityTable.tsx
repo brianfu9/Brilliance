@@ -405,7 +405,7 @@ export function ActivityTable({
           <div className="flex items-center gap-2">
             {title && (
               <CardTitle className="text-sm font-semibold">
-                {title}
+                {title}{" "}
                 <span className="text-muted-foreground text-xs font-normal">({total})</span>
               </CardTitle>
             )}

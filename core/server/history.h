@@ -2,7 +2,8 @@
  *
  * A page that keeps its own samples shows nothing of the time before it was opened. The process
  * samples once a second instead and keeps an hour: for each model the figures its Performance page
- * charts, derived from two consecutive /stats objects, and the requests that finished; for the
+ * charts, derived from two consecutive /stats objects, and (local) the requests that finished, as
+ * Server::record reported them, kept across restarts in a file when set_dir names one; for the
  * fleet every card's telemetry, every model's state and its bytes on each card. A page loads the
  * hour when it opens (`since` 0) and asks for what is new after its last sample from then on.
  *
@@ -34,7 +35,22 @@ public:
     static constexpr int kKeepS = 3600;      /* seconds of samples kept */
     /* Rows a ring holds: the hour at the five rows a second a watched page is given. */
     static constexpr int kRows = kKeepS * 5;
-    static constexpr int kRequests = 500;    /* finished requests kept for a model */
+    static constexpr int kRequests = 500;    /* finished requests kept in memory for a model */
+    /* Finished requests kept in a model's file (local): when it holds a tenth more, the oldest go. */
+    static constexpr size_t kLogCap = 100000;
+
+    /* The directory that keeps every model's finished requests across restarts, one
+     * `<model>.jsonl` each (local: RADIANCE_HISTORY_DIR). Empty keeps them in memory only. */
+    void set_dir(const std::string& dir);
+    /* One finished request of `model`, the object Server::record gives (server.h, RequestRecord):
+     * numbered (`n`, one after the last kept), kept, and appended to the model's file. A file that
+     * cannot be written logs once and the log stays in memory; it never fails the request. */
+    void request_done(const std::string& model, json rec);
+    /* Every kept request of `model`, oldest first, as columns: {"keys": [...], "rows": [[...]]}.
+     * From the file when there is one, else the memory's newest kRequests. */
+    std::string requests_body(const std::string& model) const;
+    /* The keys of a request record, in the order requests_body writes them. */
+    static const std::vector<std::string>& record_keys();
 
     /* One sample of a model from its /stats object (`body` its text), `t` in unix seconds. */
     void model_sample(const std::string& id, const json& stats, double t, std::string body = std::string());
@@ -79,13 +95,23 @@ private:
         Series series;
         json   prev;                 /* the last /stats object */
         double prev_t = 0;
-        /* Requests seen and not yet finished, by id, and the finished ones, oldest first. */
-        std::map<std::string, json> live;
-        std::set<std::string>       done;
-        std::deque<json>            finished;
         std::string                 latest;     /* the latest /stats text; empty while not open */
     };
-    void track_requests(Model& m, const json& stats, double t);
+    /* A model's finished requests (local): the newest in memory, the rest in its file. */
+    struct Log {
+        std::deque<json> recent;
+        int64_t          next = 1;       /* the number the next request gets */
+        size_t           lines = 0;      /* records in the file */
+        bool             loaded = false;
+    };
+    Log& log_locked(const std::string& model) const;
+    std::string file_of(const std::string& model) const;
+    void trim_locked(const std::string& model, Log& g) const;
+
+    mutable std::mutex           log_mu_;
+    std::string                  dir_;
+    mutable bool                 dir_failed_ = false;
+    mutable std::map<std::string, Log> logs_;
 
     mutable std::mutex           mu_;
     std::map<std::string, Model> models_;

@@ -386,6 +386,8 @@ void Front::attach(const std::string& name, const std::vector<std::string>& alia
     }
     e->aliases = aliases;
     e->server = s;
+    if (s && record_sink_)
+        s->set_record_sink([f = record_sink_, name](json rec) { f(name, std::move(rec)); });
     if (s) e->caps = s->capabilities_json();
     e->state = State::Open;
     e->why.clear();

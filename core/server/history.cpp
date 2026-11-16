@@ -3,10 +3,18 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#if defined(_WIN32)
+#include "os/os.h"   /* Brilliance: os::rename_replace -- Windows' rename will not replace a file */
+#endif
+
+#include "rad_internal.h"
 
 namespace rad {
 namespace server {
@@ -244,55 +252,13 @@ void History::Series::write(json& out, double since) const {
 
 /* ------------------------------------------------------------------ samples */
 
-void History::track_requests(Model& m, const json& stats, double t) {
-    auto finish = [&](const json& r) {
-        const double fresh = num0(r, "prompt") - num0(r, "cached");
-        const double pf = num(r, "prefill_s"), ttft = num(r, "ttft_s"), tps = num(r, "tps");
-        json h;
-        h["id"] = text(r, "id");
-        h["prompt"] = num0(r, "prompt");
-        h["out"] = num0(r, "output");
-        h["ctx"] = num0(r, "ctx");
-        if (std::isfinite(ttft)) h["ttft"] = ttft; else h["ttft"] = nullptr;
-        if (pf > 0 && fresh > 0) h["pf"] = round4(fresh / pf); else h["pf"] = nullptr;
-        if (tps > 0) h["tps"] = round4(tps); else h["tps"] = nullptr;
-        h["at"] = (int64_t)std::llround(t * 1000.0);
-        m.finished.push_back(std::move(h));
-        if (m.finished.size() > (size_t)kRequests) m.finished.pop_front();
-    };
-    std::set<std::string> seen;
-    if (const json* rq = member(stats, "requests"); rq && rq->is_array())
-        for (const json& r : *rq) {
-            const std::string id = text(r, "id");
-            if (id.empty()) continue;
-            seen.insert(id);
-            m.live[id] = r;
-            if (text(r, "state") == "done" && m.done.insert(id).second) finish(r);
-        }
-    /* A request that left the table without being seen done ended between two samples. */
-    for (auto it = m.live.begin(); it != m.live.end();) {
-        if (seen.count(it->first)) {
-            ++it;
-            continue;
-        }
-        if (!m.done.count(it->first)) finish(it->second);
-        m.done.erase(it->first);
-        it = m.live.erase(it);
-    }
-}
-
 void History::model_sample(const std::string& id, const json& stats, double t, std::string body) {
     std::lock_guard<std::mutex> lk(mu_);
     Model& m = models_[id];
     m.latest = std::move(body);
     /* Counters start over with the model: a sample of another start is no predecessor. */
     const bool same = m.prev.is_object() && num(m.prev, "started_at") == num(stats, "started_at");
-    if (!same) {
-        m.live.clear();
-        m.done.clear();
-    }
     m.series.push(t, model_row(stats, same ? &m.prev : nullptr, t - m.prev_t));
-    track_requests(m, stats, t);
     m.prev = stats;
     m.prev_t = t;
 }
@@ -328,15 +294,17 @@ void History::forget(const std::string& id) {
 json History::model_since(const std::string& id, double since) const {
     std::lock_guard<std::mutex> lk(mu_);
     json out = json::object();
-    json reqs = json::array();
     auto it = models_.find(id);
-    if (it == models_.end()) {
-        Series().write(out, since);
-    } else {
-        it->second.series.write(out, since);
-        for (const json& h : it->second.finished)
-            /* In whole milliseconds on both sides, as `at` is. */
-            if (num0(h, "at") > (double)std::llround(since * 1000.0)) reqs.push_back(h);
+    if (it == models_.end()) Series().write(out, since);
+    else it->second.series.write(out, since);
+    /* The requests that ended after `since`; `t1` is in whole milliseconds, so compare in those. */
+    json reqs = json::array();
+    {
+        std::lock_guard<std::mutex> lg(log_mu_);
+        const Log& g = log_locked(id);
+        const double cut = (double)std::llround(since * 1000.0);
+        for (const json& h : g.recent)
+            if (num0(h, "t1") > cut) reqs.push_back(h);
     }
     out["requests"] = std::move(reqs);
     return out;
@@ -381,6 +349,139 @@ std::string History::fleet_body(double since) const {
         live = fleet_live_;
     }
     return with_live(o, live);
+}
+
+/* ------------------------------------------------------------------ the request log (local) */
+
+const std::vector<std::string>& History::record_keys() {
+    static const std::vector<std::string> k = {
+        "n", "t0", "t1", "rid", "model", "path", "sse", "code", "err", "src", "ua",
+        "cache", "in", "out", "dn", "da", "pms", "dms", "prms", "ms", "pps", "tps", "ttft",
+        "ses", "pri", "tag" };
+    return k;
+}
+
+void History::set_dir(const std::string& dir) {
+    std::lock_guard<std::mutex> lg(log_mu_);
+    dir_ = dir;
+    while (dir_.size() > 1 && (dir_.back() == '/' || dir_.back() == '\\') &&
+           !(dir_.size() == 3 && dir_[1] == ':'))
+        dir_.pop_back();
+    dir_failed_ = false;
+    logs_.clear();
+    if (!dir_.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir_, ec);
+        RAD_INFO("history: finished requests are kept in %s", dir_.c_str());
+    }
+}
+
+std::string History::file_of(const std::string& model) const {
+    std::string f;
+    for (char c : model) f += (std::isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.') ? c : '_';
+    if (f.empty() || f[0] == '.') f = "_" + f;
+    return dir_ + "/" + f + ".jsonl";
+}
+
+/* Rewrites the file to its newest kLogCap records (a temporary file, then a rename). */
+void History::trim_locked(const std::string& model, Log& g) const {
+    const std::string path = file_of(model), tmp = path + ".tmp";
+    std::deque<std::string> keep;
+    {
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            keep.push_back(std::move(line));
+            if (keep.size() > kLogCap) keep.pop_front();
+        }
+    }
+    std::ofstream out(tmp, std::ios::trunc);
+    for (const std::string& l : keep) out << l << '\n';
+    out.close();
+#if defined(_WIN32)
+    const int renamed = out ? rad::os::rename_replace(tmp, path) : -1;
+#else
+    const int renamed = out ? std::rename(tmp.c_str(), path.c_str()) : -1;
+#endif
+    if (renamed != 0) {
+        std::remove(tmp.c_str());
+        return;
+    }
+    g.lines = keep.size();
+}
+
+History::Log& History::log_locked(const std::string& model) const {
+    Log& g = logs_[model];
+    if (g.loaded) return g;
+    g.loaded = true;
+    if (dir_.empty() || dir_failed_) return g;
+    {
+        std::ifstream in(file_of(model));
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            json o = json::parse(line, nullptr, false);
+            if (!o.is_object()) continue;          /* a torn last line after a crash */
+            ++g.lines;
+            g.next = std::max<int64_t>(g.next, (int64_t)num0(o, "n") + 1);
+            g.recent.push_back(std::move(o));
+            if (g.recent.size() > (size_t)kRequests) g.recent.pop_front();
+        }
+    }
+    if (g.lines > kLogCap) trim_locked(model, g);
+    return g;
+}
+
+void History::request_done(const std::string& model, json rec) {
+    std::lock_guard<std::mutex> lg(log_mu_);
+    Log& g = log_locked(model);
+    rec["n"] = g.next++;
+    if (!dir_.empty() && !dir_failed_) {
+        std::ofstream out(file_of(model), std::ios::app);
+        out << rec.dump() << '\n';
+        out.flush();
+        if (!out) {
+            dir_failed_ = true;
+            RAD_WARN("history: cannot write %s; finished requests are kept in memory only from now on",
+                     file_of(model).c_str());
+        } else if (++g.lines > kLogCap + kLogCap / 10) {
+            trim_locked(model, g);
+        }
+    }
+    g.recent.push_back(std::move(rec));
+    if (g.recent.size() > (size_t)kRequests) g.recent.pop_front();
+}
+
+std::string History::requests_body(const std::string& model) const {
+    const std::vector<std::string>& keys = record_keys();
+    json rows = json::array();
+    auto row_of = [&](const json& o) {
+        json r = json::array();
+        for (const std::string& k : keys) r.push_back(o.is_object() && o.contains(k) ? o[k] : json(nullptr));
+        rows.push_back(std::move(r));
+    };
+    {
+        std::lock_guard<std::mutex> lg(log_mu_);
+        const Log& g = log_locked(model);
+        if (!dir_.empty() && !dir_failed_) {
+            std::ifstream in(file_of(model));
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                const json o = json::parse(line, nullptr, false);
+                if (o.is_object()) row_of(o);
+            }
+        } else {
+            for (const json& o : g.recent) row_of(o);
+        }
+    }
+    json out = json::object();
+    json k = json::array();
+    for (const std::string& s : keys) k.push_back(s);
+    out["keys"] = std::move(k);
+    out["rows"] = std::move(rows);
+    return out.dump();
 }
 
 }  // namespace server

@@ -1103,6 +1103,67 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
                r.id.c_str(), from_peer(r.peer).c_str(), finish_reason_oai(overall),
                (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen,
                reason, ttft_s, rate_s, e2e);
+
+    std::function<void(json)> sink;
+    {
+        std::lock_guard<std::mutex> lk(record_m_);
+        sink = record_sink_;
+    }
+    if (sink) sink(request_record(r, t, overall, n_gen, e2e));
+}
+
+/* (local) The dashboard's record of one finished request: what llama-swap stored of it, from the
+ * same figures the response's `timings` carry (History::record_keys names the members). */
+json Server::request_record(const OaiRequest& r, const TimingsOut& t, Finish overall, int64_t n_gen,
+                            double e2e) {
+    auto rate = [](int64_t n, double ms) { return n > 0 && ms > 0.0 ? (double)n * 1000.0 / ms : 0.0; };
+    auto host_of = [](std::string p) {
+        if (!p.empty() && p[0] == '[') return p.substr(1, p.find(']') == std::string::npos ? std::string::npos : p.find(']') - 1);
+        const size_t c = p.rfind(':');
+        return c != std::string::npos && p.find(':') == c ? p.substr(0, c) : p;
+    };
+    const int64_t t1 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count();
+    const double total_ms = t.valid && t.total_ms >= 0.0 ? t.total_ms : e2e * 1000.0;
+    json o;
+    o["t0"] = t1 - (int64_t)std::llround(total_ms);
+    o["t1"] = t1;
+    o["rid"] = r.id;
+    o["model"] = r.model;
+    o["path"] = r.path;
+    o["sse"] = r.stream;
+    o["code"] = overall == Finish::Error ? 500 : 200;
+    o["err"] = overall == Finish::Error ? "the engine failed the request"
+             : overall == Finish::Cancelled ? "client disconnected" : "";
+    if (!r.forwarded_for.empty()) {
+        std::string f = r.forwarded_for.substr(0, r.forwarded_for.find(','));
+        while (!f.empty() && f.front() == ' ') f.erase(0, 1);
+        o["src"] = "xff:" + f;
+    } else {
+        o["src"] = r.peer.empty() ? std::string("in-process") : "ip:" + host_of(r.peer);
+    }
+    o["ua"] = r.user_agent;
+    o["cache"] = t.valid ? t.cache_n : 0;
+    o["in"] = t.valid ? t.prompt_n : 0;
+    o["out"] = t.valid ? t.predicted_n : n_gen;
+    o["dn"] = t.draft_n;
+    o["da"] = t.draft_n_accepted;
+    o["pms"] = t.valid && t.prompt_ms >= 0.0 ? t.prompt_ms : -1.0;
+    o["dms"] = t.valid ? t.predicted_ms : -1.0;
+    o["prms"] = t.preempted_ms;
+    o["ms"] = total_ms;
+    o["pps"] = t.valid ? rate(t.prompt_n, t.prompt_ms) : 0.0;
+    o["tps"] = t.valid ? rate(t.decode_n, t.predicted_ms) : 0.0;
+    o["ttft"] = t.valid && t.ttft_ms >= 0.0 ? json(t.ttft_ms) : json(nullptr);
+    o["ses"] = !r.session_header.empty() ? r.session_header : r.session_label;
+    o["pri"] = r.priority;
+    o["tag"] = r.tag;
+    return o;
+}
+
+void Server::set_record_sink(std::function<void(json)> f) {
+    std::lock_guard<std::mutex> lk(record_m_);
+    record_sink_ = std::move(f);
 }
 
 /* ------------------------------------------------------------------ non-streaming */
@@ -1688,6 +1749,15 @@ HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
     r.peer = req.peer;
     if (auto t = req.headers.find("X-Request-Tag"); t != req.headers.end())
         r.tag = t->second.substr(0, 23);
+    r.path = req.path;
+    auto header = [&](const char* k) {
+        auto h = req.headers.find(k);
+        return h == req.headers.end() ? std::string() : h->second.substr(0, 200);
+    };
+    r.user_agent = header("User-Agent");
+    r.forwarded_for = header("X-Forwarded-For");
+    r.session_header = header("X-Session-ID");
+    if (r.session_header.empty()) r.session_header = header("X-Litellm-Session-Id");
     if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
         return *no;
     log_admitted(r);

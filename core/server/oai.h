@@ -90,6 +90,10 @@ struct OaiRequest {
     std::string session_label;
     /* The X-Request-Tag header (Request::tag), "" if none. */
     std::string tag;
+    /* (local) For the dashboard's request record (Server::record): the route, the client's
+     * User-Agent and X-Forwarded-For, and its session header (X-Session-ID or
+     * X-Litellm-Session-Id, the ones llama-swap read), "" where absent. */
+    std::string path, user_agent, forwarded_for, session_header;
     /* The build, as OpenAI's and llama.cpp's `system_fingerprint`. */
     std::string system_fingerprint;
 

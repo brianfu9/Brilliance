@@ -14,8 +14,12 @@
 
 #include "server/history.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 using namespace rad;
@@ -128,55 +132,141 @@ TEST(a_value_a_sample_did_not_yield_is_null_and_an_empty_column_is_left_out) {
     CHECK(!j["c"].contains("lkAr"));                 /* no link counters in these objects */
 }
 
-TEST(a_request_is_recorded_once_when_it_finishes) {
+/* (local) A finished request comes from Server::record, not from the samples: it is numbered,
+ * kept, and `since` cuts it by the time it ended (`t1`, unix milliseconds). */
+TEST(a_finished_request_is_numbered_kept_and_cut_by_since) {
     History h;
-    json s = stats(7, 100, 2.2e9, 10);
-    s["requests"] = json::parse(R"([{"id": "r1", "state": "decode", "prompt": 400, "cached": 0, "output": 10, "ctx": 410, "tps": 50},
-                                    {"id": "r2", "state": "decode", "prompt": 100, "cached": 0, "output": 5, "ctx": 105, "tps": 40}])");
-    h.model_sample("m", s, 10.0);
-    CHECK_EQ((int)h.model_since("m", 0)["requests"].size(), 0);
-    /* r1 is seen done and stays in the table for a while; r2 leaves between two samples. */
-    s["requests"] = json::parse(R"([{"id": "r1", "state": "done", "prompt": 400, "cached": 100, "output": 90, "ctx": 490,
-                                     "ttft_s": 0.25, "prefill_s": 0.5, "tps": 55}])");
-    h.model_sample("m", s, 11.0);
-    h.model_sample("m", s, 12.0);
+    h.request_done("m", json::parse(R"({"rid": "r1", "t0": 1794590850000, "t1": 1794590851000, "out": 90})"));
+    h.request_done("m", json::parse(R"({"rid": "r2", "t0": 1794590851000, "t1": 1794590852500, "out": 5})"));
     json r = h.model_since("m", 0)["requests"];
     REQUIRE_EQ((int)r.size(), 2);
-    CHECK_EQ(r[0]["id"].get<std::string>(), "r1");
-    CHECK_EQ(r[0]["out"].get<double>(), 90.0);
-    CHECK_EQ(r[0]["pf"].get<double>(), 600.0);       /* 300 fresh tokens in half a second */
-    CHECK_EQ(r[0]["ttft"].get<double>(), 0.25);
-    CHECK_EQ(r[1]["id"].get<std::string>(), "r2");
-    CHECK(r[1]["ttft"].is_null());
-    /* `since` cuts the requests as it cuts the samples. */
-    CHECK_EQ((int)h.model_since("m", 11.5)["requests"].size(), 0);
+    CHECK_EQ(r[0]["rid"].get<std::string>(), "r1");
+    CHECK_EQ(r[0]["n"].get<int64_t>(), (int64_t)1);
+    CHECK_EQ(r[1]["n"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ((int)h.model_since("m", 1794590851.0)["requests"].size(), 1);
+    CHECK_EQ((int)h.model_since("m", 1794590852.5)["requests"].size(), 0);
+    CHECK_EQ((int)h.model_since("other", 0)["requests"].size(), 0);
+    /* The samples no longer make requests: a row that leaves the table records nothing. */
+    json s = stats(7, 100, 2.2e9, 10);
+    s["requests"] = json::parse(R"([{"id": "r9", "state": "decode", "prompt": 4, "cached": 0, "output": 1, "ctx": 5, "tps": 5}])");
+    h.model_sample("m", s, 10.0);
+    s["requests"] = json::array();
+    h.model_sample("m", s, 11.0);
+    CHECK_EQ((int)h.model_since("m", 0)["requests"].size(), 2);
+}
+
+namespace {
+std::string temp_dir() {
+    static std::atomic<int> seq{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    std::error_code ec;
+    const auto base = std::filesystem::temp_directory_path(ec);
+    if (ec) return std::string();
+    const auto p = base / ("history_test_" + std::to_string(stamp) + "_" + std::to_string(++seq));
+    std::filesystem::create_directories(p, ec);
+    return ec ? std::string() : p.string();
+}
+void remove_dir(const std::string& dir) {
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+int lines_of(const std::string& path) {
+    std::ifstream in(path);
+    std::string l;
+    int n = 0;
+    while (std::getline(in, l)) n += !l.empty();
+    return n;
+}
+}  // namespace
+
+/* (local) With a directory, the requests outlive the process: a new History reads them back,
+ * numbers on from the last, and answers all of them as columns. */
+TEST(the_request_log_survives_a_restart_and_numbers_on) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    {
+        History h;
+        h.set_dir(dir);
+        for (int i = 0; i < 3; ++i)
+            h.request_done("qwen27b", json::parse(R"({"t1": )" + std::to_string(1000 + i) + R"(, "out": 7, "ses": "s"})"));
+    }
+    CHECK_EQ(lines_of(dir + "/qwen27b.jsonl"), 3);
+    History h;
+    h.set_dir(dir);
+    CHECK_EQ((int)h.model_since("qwen27b", 0)["requests"].size(), 3);
+    h.request_done("qwen27b", json::parse(R"({"t1": 2000})"));
+    const json b = json::parse(h.requests_body("qwen27b"));
+    REQUIRE_EQ((int)b["rows"].size(), 4);
+    const json& keys = b["keys"];
+    REQUIRE_EQ(keys[0].get<std::string>(), "n");
+    CHECK_EQ(b["rows"][3][0].get<int64_t>(), (int64_t)4);
+    int ses = -1;
+    for (size_t i = 0; i < keys.size(); ++i) if (keys[i].get<std::string>() == "ses") ses = (int)i;
+    REQUIRE(ses >= 0);
+    CHECK_EQ(b["rows"][0][ses].get<std::string>(), "s");
+    CHECK(b["rows"][3][ses].is_null());
+    /* A model's name never leaves the directory. */
+    h.request_done("../x/y", json::parse(R"({"t1": 1})"));
+    CHECK_EQ(lines_of(dir + "/.._x_y.jsonl") + lines_of(dir + "/_.._x_y.jsonl"), 1);
+    remove_dir(dir);
+}
+
+/* (local) A file over the cap is cut to its newest kLogCap records when it is read. */
+TEST(the_request_log_keeps_its_newest_records_up_to_the_cap) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    const int n = (int)History::kLogCap + 5;
+    {
+        std::ofstream out(dir + "/m.jsonl");
+        for (int i = 1; i <= n; ++i) out << "{\"n\":" << i << ",\"t1\":" << i << "}\n";
+        out << "{\"n\":";                         /* a torn last line */
+    }
+    History h;
+    h.set_dir(dir);
+    const json r = h.model_since("m", 0)["requests"];
+    REQUIRE_EQ((int)r.size(), History::kRequests);
+    CHECK_EQ(r[r.size() - 1]["n"].get<int64_t>(), (int64_t)n);
+    CHECK_EQ(lines_of(dir + "/m.jsonl"), (int)History::kLogCap);
+    h.request_done("m", json::parse(R"({"t1": 9999999})"));
+    const json last = h.model_since("m", 0)["requests"];
+    CHECK_EQ(last[last.size() - 1]["n"].get<int64_t>(), (int64_t)n + 1);
+    remove_dir(dir);
+}
+
+/* (local) A directory that cannot be written costs nothing but the file: requests stay in memory. */
+TEST(an_unwritable_request_log_keeps_requests_in_memory) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    const std::string blocker = dir + "/file";
+    { std::ofstream f(blocker); f << "x"; }
+    History h;
+    h.set_dir(blocker + "/sub");
+    h.request_done("m", json::parse(R"({"t1": 5})"));
+    h.request_done("m", json::parse(R"({"t1": 6})"));
+    CHECK_EQ((int)h.model_since("m", 0)["requests"].size(), 2);
+    CHECK_EQ((int)json::parse(h.requests_body("m"))["rows"].size(), 2);
+    remove_dir(dir);
 }
 
 /* A page asks for what came after the last sample time it was given. Times are sent to the
  * millisecond, so a sample taken between two milliseconds must not be later than its own sent
- * time: asked with it, the history answers with nothing of that sample, and with no request that
- * finished in it. */
-TEST(asking_with_the_last_time_given_repeats_neither_a_sample_nor_a_request) {
+ * time: asked with it, the history answers with nothing of that sample. */
+TEST(asking_with_the_last_time_given_does_not_repeat_a_sample) {
     for (double frac : { 0.0, 0.0004, 0.0006, 0.84561, 0.9996 }) {
         History h;
         json s = stats(7, 100, 2.2e9, 10);
-        s["requests"] = json::parse(R"([{"id": "r1", "state": "decode", "prompt": 40, "cached": 0, "output": 3, "ctx": 43, "tps": 50}])");
         h.model_sample("m", s, 1794590850.0 + frac);
-        s["requests"] = json::array();
-        h.model_sample("m", s, 1794590851.0 + frac);       /* r1 is gone: it finished */
+        h.model_sample("m", s, 1794590851.0 + frac);
         const json all = h.model_since("m", 0);
         REQUIRE_EQ((int)all["t"].size(), 2);
-        REQUIRE_EQ((int)all["requests"].size(), 1);
         const double last = all["t"][1].get<double>();
         /* The page sends the number back as text. */
         const double asked = std::strtod(json(last).dump().c_str(), nullptr);
         const json next = h.model_since("m", asked);
         CHECK_EQ((int)next["t"].size(), 0);
-        CHECK_EQ((int)next["requests"].size(), 0);
-        /* Asked with the sample before, it gets exactly the last one and its request. */
+        /* Asked with the sample before, it gets exactly the last one. */
         const json one = h.model_since("m", all["t"][0].get<double>());
         CHECK_EQ((int)one["t"].size(), 1);
-        CHECK_EQ((int)one["requests"].size(), 1);
         h.fleet_sample(json::parse(R"({"models": [], "cards": [{"card": 0, "free_bytes": 7}]})"), 1794590851.0 + frac);
         const json f = h.fleet_since(0);
         REQUIRE_EQ((int)f["t"].size(), 1);

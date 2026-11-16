@@ -43,6 +43,7 @@
  */
 #pragma once
 #include "server/http.h"
+#include "server/iface.h"
 
 #include <array>
 #include <atomic>
@@ -125,6 +126,9 @@ public:
     void fail(const std::string& name, const std::string& why, int64_t retry_ms);
     /* `s` serves the model `name` from now on. */
     void attach(const std::string& name, const std::vector<std::string>& aliases, Server* s);
+    /* (local) Every Server attached from now on hands each finished request's record to `f`, with
+     * the model's name (the fleet's History::request_done). Set before the first attach. */
+    void set_record_sink(std::function<void(const std::string&, json)> f) { record_sink_ = std::move(f); }
     /* No new request reaches `name` (they wait for it to come back); returns once every response
      * handed out for it is gone, or after `wait_ms`, whichever is first. False when responses were
      * still held at the deadline, and the model stays Closing; a later call waits again. On true
@@ -259,6 +263,7 @@ private:
     std::function<std::string()>                   fleet_metrics_;
 
     mutable std::mutex      mu_;
+    std::function<void(const std::string&, json)> record_sink_;
     /* Finished jobs, oldest first; their own lock, since one is answered without a model. */
     std::mutex              jobs_mu_;
     /* A model's last /sessions answer and when it was read. Listing the

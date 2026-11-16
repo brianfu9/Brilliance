@@ -625,6 +625,7 @@ radiance sets the first five before the runtime starts, only where they are unse
 | `RADIANCE_EXPERT_SPLIT` | routed experts per rank, comma-separated, summing to the model's: an uneven split. A list that does not fit the model is refused. | an even split | comma-separated counts | developer | `arch/common/rad_expert_split.h:27` |
 | `RADIANCE_DS41_EXPERT_SPLIT` | DeepSeek 4.1's own older name for `RADIANCE_EXPERT_SPLIT` (each count even), read when that is unset | an even split | comma-separated even counts | developer | `arch/deepseek41/deepseek41.cpp:701` |
 | `RADIANCE_MEDIA_OUT` | folder where finished generated images (`images/`) and videos (`videos/`) are saved with a shared zero-padded index (`.index`) | unset (disabled) | folder path | operator | `core/engine.cpp:3881` |
+| `RADIANCE_HISTORY_DIR` | folder where finished request logs (`<model>.jsonl`) and fleet off-switch state (`fleet-off.json`) are kept across restarts | unset (in-memory only) | folder path | operator | `core/fleet/fleet.cpp:2722` |
 
 ### Calibration (for converting models)
 

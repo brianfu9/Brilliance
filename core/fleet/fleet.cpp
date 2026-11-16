@@ -2919,6 +2919,18 @@ void Fleet::add_routes() {
      * it neither brings a model back nor costs a running one anything. A model's history is as
      * open as its /stats, whose figures it repeats, and the fleet's as guarded as /admin/fleet:
      * a browser the fleet view is refused to still draws the server's own model from it. */
+    /* (local) Each finished text request's record (Server::record) goes to the history, kept across
+     * restarts in RADIANCE_HISTORY_DIR when it is set. `GET /history/requests?model=` answers every
+     * kept record of a model as columns, for the Requests tab; a model's records are as open as its
+     * /history. */
+    if (const char* d = std::getenv("RADIANCE_HISTORY_DIR"); d && *d) history_.set_dir(d);
+    front_.set_record_sink([this](const std::string& model, json rec) { history_.request_done(model, std::move(rec)); });
+    front_.route("GET", "/history/requests", [this](const server::HttpRequest& q) {
+        auto it = q.query.find("model");
+        if (it == q.query.end() || it->second.empty())
+            return server::HttpResponse::json_body(400, "{\"error\":{\"message\":\"name the model: /history/requests?model=<id>\"}}");
+        return server::HttpResponse::json_body(200, history_.requests_body(it->second));
+    });
     front_.route("GET", "/history", [this, guard, ok](const server::HttpRequest& q) {
         double since = 0;
         if (auto it = q.query.find("since"); it != q.query.end()) since = std::strtod(it->second.c_str(), nullptr);

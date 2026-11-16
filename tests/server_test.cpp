@@ -2093,6 +2093,55 @@ TEST(a_response_carries_its_requests_timings_and_draft_counts) {
 /* The rates are tokens over the time that produced them, the first token counting as the prompt
  * phase's; a rate whose count or time is zero is null, as is a prompt time the engine never
  * reported. */
+/* (local) The dashboard's record of a finished request carries what the response's timings carry,
+ * and who asked: the route, the client's session header, its User-Agent and address. */
+TEST(a_finished_request_hands_its_record_to_the_sink) {
+    Fixture f;
+    f.sched.drafts = 3;
+    std::vector<json> got;
+    f.srv->set_record_sink([&](json r) { got.push_back(std::move(r)); });
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/chat/completions";
+    q.body = R"({"model":"rad","messages":[{"role":"user","content":"hi"}],"priority":3})";
+    q.peer = "100.64.0.7:51234";
+    q.headers["User-Agent"] = "opencode/1.2";
+    q.headers["X-Session-ID"] = "ses_abc";
+    HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    const json j = json::parse(r.body);
+    REQUIRE_EQ((int)got.size(), 1);
+    const json& g = got[0];
+    CHECK_EQ(g["rid"].get<std::string>(), j["id"].get<std::string>());
+    CHECK_EQ(g["model"].get<std::string>(), "rad");
+    CHECK_EQ(g["path"].get<std::string>(), "/v1/chat/completions");
+    CHECK_EQ(g["code"].get<int64_t>(), (int64_t)200);
+    CHECK_EQ(g["err"].get<std::string>(), "");
+    CHECK_EQ(g["src"].get<std::string>(), "ip:100.64.0.7");
+    CHECK_EQ(g["ua"].get<std::string>(), "opencode/1.2");
+    CHECK_EQ(g["ses"].get<std::string>(), "ses_abc");
+    CHECK_EQ(g["pri"].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(g["sse"].get<bool>(), false);
+    const json& t = j["timings"];
+    CHECK_EQ(g["in"].get<int64_t>(), t["prompt_n"].get<int64_t>());
+    CHECK_EQ(g["cache"].get<int64_t>(), t["cache_n"].get<int64_t>());
+    CHECK_EQ(g["out"].get<int64_t>(), t["predicted_n"].get<int64_t>());
+    CHECK_EQ(g["dn"].get<int64_t>(), t["draft_n"].get<int64_t>());
+    CHECK_EQ(g["da"].get<int64_t>(), t["draft_n_accepted"].get<int64_t>());
+    CHECK_NEAR(g["dms"].get<double>(), t["predicted_ms"].get<double>(), 1e-9);
+    CHECK(g["t1"].get<int64_t>() >= g["t0"].get<int64_t>());
+    /* Without the header the body's session_id names the session; behind a proxy, the first
+     * X-Forwarded-For address is the source. */
+    q.headers.erase("X-Session-ID");
+    q.headers["X-Forwarded-For"] = "10.0.0.9, 127.0.0.1";
+    q.body = R"({"messages":[{"role":"user","content":"hi"}],"session_id":"conv-7"})";
+    HttpResponse r2 = f.srv->router().dispatch(q);
+    CHECK_EQ(r2.status, 200);
+    REQUIRE_EQ((int)got.size(), 2);
+    CHECK_EQ(got[1]["ses"].get<std::string>(), "conv-7");
+    CHECK_EQ(got[1]["src"].get<std::string>(), "xff:10.0.0.9");
+}
+
 TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
     TimingsOut t;
     t.valid = true;

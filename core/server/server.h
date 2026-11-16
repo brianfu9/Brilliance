@@ -329,7 +329,14 @@ public:
      * handed in rather than taken inside it. */
     void note_ready(uint64_t begin_ns);
 
+    /* (local) Called with each finished text request's record (request_record) when set; the
+     * fleet passes it to the dashboard's history (History::request_done). Thread-safe. */
+    void set_record_sink(std::function<void(json)> f);
+
 private:
+    json request_record(const OaiRequest& r, const TimingsOut& t, Finish overall, int64_t n_gen, double e2e);
+    std::mutex                 record_m_;
+    std::function<void(json)>  record_sink_;
     std::string template_default_effort_;
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */

@@ -3,10 +3,8 @@
 // /sessions, /graph and /server_info are asked for once, when their view is opened.
 
 export interface Columns { [name: string]: (number | null)[] }
-export interface FinishedRequest {
-  id: string; prompt: number; out: number; ctx: number
-  ttft: number | null; pf: number | null; tps: number | null; at: number
-}
+/** A finished request as /history sends it (Server::record; activity/records.ts reads it). */
+export type FinishedRequest = Record<string, unknown>
 export interface HistoryBody<Live> {
   keep_s: number
   t: number[]
@@ -50,6 +48,9 @@ export interface Fleet {
 export interface RunningRequest {
   id: string | number; state: string; prompt: number; computed: number; cached: number; output: number
   max: number; age_s: number; tps: number
+  ctx: number; kv_tokens: number; priority: number
+  // Emitted only while they apply (dashboard.cpp): a tag given, a place in the queue, a hold, an admission need.
+  ttft_s?: number; prefill_s?: number; tag?: string; queue_pos?: number; wait?: string; held_s?: number; admit_tokens?: number
 }
 export interface DraftPosition { reached: number; rate: number }
 export interface ExpertTier { name: string; units: number; bytes: number }
@@ -60,6 +61,8 @@ export interface Stats {
   jobs: { running: number; done: number; failed: number; total_ms: number; last_ms: number }
   running?: number; waiting?: number
   kv_bytes_used?: number; kv_bytes_total?: number
+  kv_tokens_used?: number; kv_tokens_total?: number; kv_tokens_cached?: number; now_ms: number
+  queue?: { kv_reserve: number; backfill_ms: number }
   prefix_hit_rate?: number; prefill_tps?: number; decode_tps?: number
   total_requests?: number; preemptions?: number
   step_ns_decode_best?: number

@@ -62,7 +62,7 @@ export function ModelPage({ id, tab, model, models, local }: { id: string; tab: 
             {scope.series.t.length === 0 && !serving ? <Empty>{model.state === "failed" ? "The model failed to start, so there is no data" : model.state === "cold" ? "This model has not been loaded yet. It loads when a request asks for it." : "No data yet. Charts appear once the model has been loaded."}</Empty>
               : <Performance scope={scope} kind={kind} slots={slots} noun={noun} />}
           </>
-        ) : shown === "requests" ? <Requests scope={scope} />
+        ) : shown === "requests" ? <Requests id={id} scope={scope} />
         : shown === "sessions" ? (serving ? <SessionsView model={id} /> : <Empty>Conversations are listed while the model is loaded</Empty>)
         : <Details model={id} stats={s} />}
     </div>

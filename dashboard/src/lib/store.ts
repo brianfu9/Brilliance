@@ -1,8 +1,9 @@
 // The page's copy of what the process remembers. One Scope per subject (the fleet, or a model):
 // it loads the server's hour once, then asks five times a second for what came after its last sample and
 // appends it. Views read a scope through useScope and redraw when its version moves.
-import { useSyncExternalStore } from "react"
-import { HttpError, api, withModel, type FinishedRequest, type Fleet, type HistoryBody, type Stats } from "./api"
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react"
+import { HttpError, api, withModel, type Fleet, type HistoryBody, type Stats } from "./api"
+import { appendNew, fromColumns, mergeLog, normalize, type RecordColumns, type RequestRecord } from "./activity/records"
 
 const KEEP_S = 3600
 // The server samples five times a second while a page asks (once a second otherwise), so each
@@ -52,7 +53,7 @@ type Listener = () => void
 export class Scope<Live> {
   series = new Series()
   live: Live | null = null
-  finished: FinishedRequest[] = []
+  finished: RequestRecord[] = []
   loaded = false
   error: string | null = null
   /** True once the server said this subject is not for this client (403): asking again is pointless. */
@@ -93,9 +94,7 @@ export class Scope<Live> {
       const b = await api<HistoryBody<Live>>(this.path + (since ? sep + "since=" + since : ""))
       this.series.append(b.t, b.c)
       if (b.requests?.length) {
-        const have = new Set(this.finished.slice(-64).map((r) => r.id + ":" + r.at))
-        for (const r of b.requests) if (!have.has(r.id + ":" + r.at)) this.finished.push(r)
-        if (this.finished.length > 500) this.finished.splice(0, this.finished.length - 500)
+        appendNew(this.finished, b.requests.map(normalize), 500)
       }
       this.live = b.live
       this.loaded = true
@@ -123,4 +122,27 @@ export function modelScope(id: string): Scope<Stats> {
 export function useScope<L>(s: Scope<L>): Scope<L> {
   useSyncExternalStore(s.subscribe, s.getVersion)
   return s
+}
+
+/**
+ * Every kept request of a model: GET /history/requests once (the engine's file, as columns), then
+ * the ones the scope's /history poll brings. Oldest first, one per number.
+ */
+export function useRequestLog(id: string, scope: Scope<Stats>): { records: RequestRecord[]; loaded: boolean; error: string | null } {
+  const [base, setBase] = useState<RequestRecord[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    let live = true
+    api<RecordColumns>(withModel("history/requests", id))
+      .then((c) => { if (live) setBase(fromColumns(c)) })
+      .catch((e) => { if (live) setError(e instanceof Error ? e.message : String(e)) })
+    return () => { live = false }
+  }, [id])
+  const tail = scope.finished
+  const records = useMemo(() => {
+    return mergeLog(base ?? [], tail)
+    // The scope's list grows in place; its length and last number say when it changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [base, tail.length, tail.length ? tail[tail.length - 1].n : 0])
+  return { records, loaded: base !== null || error !== null, error }
 }

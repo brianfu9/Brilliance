@@ -6,6 +6,9 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { Stats } from "@/lib/api"
 import { DASH, fDur, fNum, fSig, fin } from "@/lib/format"
 import { useRequestLog, type Scope } from "@/lib/store"
+import { useMemo } from "react"
+import { ActivityStats } from "@/components/activity/ActivityStats"
+import { buildStats } from "@/lib/activity/records"
 
 const median = (a: number[]) => { if (!a.length) return null; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1] }
 
@@ -14,6 +17,7 @@ export function Requests({ id, scope }: { id: string; scope: Scope<Stats> }) {
   const { records } = useRequestLog(id, scope)
   const speeds = records.map((r) => r.tps).filter((v) => v > 0)
   const ttfts = records.map((r) => r.ttft).filter((v): v is number => v !== null).map((v) => v / 1000)
+  const stats = useMemo(() => buildStats(records), [records])
   const mean = speeds.length ? speeds.reduce((a, b) => a + b, 0) / speeds.length : null
 
   return (
@@ -24,6 +28,7 @@ export function Requests({ id, scope }: { id: string; scope: Scope<Stats> }) {
         <Kpi label="Mean speed" value={fin(mean) ? fSig(mean) : DASH} unit="tok/s" detail={`over ${fNum(speeds.length)} kept`} />
         <Kpi label="Median time to first token" value={ttfts.length ? fDur(median(ttfts)) : DASH} detail={`over ${fNum(ttfts.length)} kept`} />
       </div>
+      <ActivityStats stats={stats} />
       <Panel title="Time to first token" description="Distribution across the kept requests">
         <Histogram values={ttfts} />
       </Panel>

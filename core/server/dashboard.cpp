@@ -19,7 +19,10 @@
 #include "util/json.h"
 
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <vector>
 
 namespace rad {
@@ -646,6 +649,18 @@ HttpResponse dashboard_page() {
     r.status = 200;
     r.content_type = "text/html; charset=utf-8";
     r.body = kPage;
+    /* (local) RADIANCE_DASHBOARD_PAGE names a built page (dashboard/'s dist/index.html) served in
+     * place of the compiled-in one, read again on every load: a page change is a file copy, not an
+     * engine build. A missing or empty file serves the built-in page, so removing it rolls back.
+     * The page is the operator's own file; the same CSP below still binds it. */
+    if (const char* p = std::getenv("RADIANCE_DASHBOARD_PAGE"); p && *p) {
+        std::ifstream in(p, std::ios::binary);
+        std::ostringstream s;
+        if (in && (s << in.rdbuf()) && s.tellp() > 0) {
+            r.body = s.str();
+            r.set_header("X-Radiance-Page", "file");
+        }
+    }
     /* Brilliance: a link to the terms of use (GET /terms, terms.cpp) in the page's corner, added
      * here rather than in dashboard/'s sources, so the generated page stays upstream's. */
     if (const size_t at = r.body.rfind("</body>"); at != std::string::npos)

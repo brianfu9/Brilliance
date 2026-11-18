@@ -247,3 +247,21 @@ describe("latestSession", () => {
     expect(latestSession([])).toBe("");
   });
 });
+
+describe("buildHeatGrid size", () => {
+  it("gives each cell the geometric mean of its points' sizes, -1 when none", () => {
+    const grid = buildHeatGrid(
+      [
+        { x: 10, y: 10, size: 1000 },
+        { x: 10, y: 10, size: 4000 },
+        { x: 100, y: 100 },
+      ],
+      { xScale: "linear", xBins: 2, yBins: 2 },
+    );
+    const byX = new Map(grid.cells.map((c) => [Math.round(c.cx), c]));
+    const low = grid.cells.find((c) => c.count === 2);
+    expect(low?.size).toBeCloseTo(2000, 6);
+    expect(grid.cells.find((c) => c.count === 1)?.size).toBe(-1);
+    expect(byX.size).toBe(2);
+  });
+});

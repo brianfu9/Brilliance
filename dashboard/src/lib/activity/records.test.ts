@@ -44,7 +44,7 @@ describe("records", () => {
     expect(s.total_input_tokens).toBe(110)
     expect(s.total_output_tokens).toBe(70)
     expect(s.total_cache_tokens).toBe(940)
-    expect(s.prompt_scatter).toEqual([{ length: 100, speed: 1000, prefill_ms: 100, session: "a" }])
+    expect(s.prompt_scatter).toEqual([{ length: 100, context: 1000, speed: 1000, prefill_ms: 100, session: "a" }])
     expect(s.gen_scatter.map((p) => p.context)).toEqual([1000, 40])
     expect(s.gen_scatter[0].accept).toBe(0.5)
     expect(s.gen_scatter[1].accept).toBe(-1)

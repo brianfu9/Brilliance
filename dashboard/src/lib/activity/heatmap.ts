@@ -19,6 +19,8 @@ export interface HeatSource {
   y: number;
   /** 0..1, or -1/undefined when the request reported no draft tokens. */
   accept?: number;
+  /** A positive value the cell summarizes as a geometric mean (prefill: new tokens). */
+  size?: number;
 }
 
 /**
@@ -36,6 +38,8 @@ export interface HeatCell {
   count: number;
   /** Mean acceptance over the cell's points that reported one, else -1. */
   accept: number;
+  /** Geometric mean of the cell's positive `size` values, else -1. */
+  size: number;
 }
 
 export interface HeatGrid {
@@ -54,6 +58,8 @@ interface Accumulator {
   count: number;
   acceptSum: number;
   acceptCount: number;
+  sizeLogSum: number;
+  sizeCount: number;
 }
 
 /**
@@ -150,13 +156,17 @@ export function buildHeatGrid(points: HeatSource[], opts: HeatGridOptions): Heat
     const key = iy * xBins + ix;
     let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { count: 0, acceptSum: 0, acceptCount: 0 };
+      bucket = { count: 0, acceptSum: 0, acceptCount: 0, sizeLogSum: 0, sizeCount: 0 };
       buckets.set(key, bucket);
     }
     bucket.count++;
     if (point.accept !== undefined && point.accept >= 0) {
       bucket.acceptSum += point.accept;
       bucket.acceptCount++;
+    }
+    if (point.size !== undefined && Number.isFinite(point.size) && point.size > 0) {
+      bucket.sizeLogSum += Math.log(point.size);
+      bucket.sizeCount++;
     }
   }
 
@@ -174,6 +184,7 @@ export function buildHeatGrid(points: HeatSource[], opts: HeatGridOptions): Heat
       cy: yLo + (iy + 0.5) * yStep,
       count: bucket.count,
       accept: bucket.acceptCount > 0 ? bucket.acceptSum / bucket.acceptCount : -1,
+      size: bucket.sizeCount > 0 ? Math.exp(bucket.sizeLogSum / bucket.sizeCount) : -1,
     });
     if (bucket.count > maxCount) maxCount = bucket.count;
   }

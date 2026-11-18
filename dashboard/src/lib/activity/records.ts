@@ -139,7 +139,7 @@ export function buildStats(records: RequestRecord[]): ActivityStatsData {
     if (!(r.pps > 0 || r.tps > 0)) continue
     if (r.pps > 0) {
       prompt.push(r.pps)
-      if (r.in > 0) promptScatter.push({ length: r.in, speed: r.pps, prefill_ms: Math.round(r.pms), session: r.ses })
+      if (r.in > 0) promptScatter.push({ length: r.in, context: r.in + Math.max(0, r.cache), speed: r.pps, prefill_ms: Math.round(r.pms), session: r.ses })
     }
     if (r.tps > 0 && r.out >= MIN_DECODE_TOKENS) {
       gen.push(r.tps)

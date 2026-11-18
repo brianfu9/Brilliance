@@ -58,6 +58,26 @@ export function acceptColor(accept: number, dark: boolean): string {
   return (dark ? ACCEPT_RAMP_DARK : ACCEPT_RAMP_LIGHT)[bucket];
 }
 
+/**
+ * New (uncached) prompt tokens bucketed 0..4 at 2k, 4k, 8k and 32k: an agent turn sends 2-4k, a
+ * cold start or a long tool result more. -1 when unknown.
+ */
+export const NEW_TOKEN_EDGES = [2000, 4000, 8000, 32000];
+export const NEW_TOKEN_LABELS = ["<2k", "2-4k", "4-8k", "8-32k", "32k+"];
+export function newTokensBucket(tokens: number): number {
+  if (!(tokens > 0)) return -1;
+  let b = 0;
+  while (b < NEW_TOKEN_EDGES.length && tokens >= NEW_TOKEN_EDGES[b]) b++;
+  return b;
+}
+
+/** Ramp color for a new-token count (the acceptance ramp's steps), or neutral gray when unknown. */
+export function newTokensColor(tokens: number, dark: boolean): string {
+  const bucket = newTokensBucket(tokens);
+  if (bucket === -1) return dark ? OTHER_DARK : OTHER_LIGHT;
+  return (dark ? ACCEPT_RAMP_DARK : ACCEPT_RAMP_LIGHT)[bucket];
+}
+
 /** Last 6 characters of a session id, or the whole string when shorter. */
 export function shortSession(session: string): string {
   if (session === "") return "";

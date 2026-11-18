@@ -258,7 +258,10 @@ export interface HistogramData {
 }
 
 export interface PromptScatterPoint {
+  /** New (uncached) prompt tokens. */
   length: number;
+  /** Cached + new tokens: the context the prefill ran against. Absent in older data. */
+  context?: number;
   speed: number;
   /** llama-server's prompt_ms; <= 0 means the request reported no timing. */
   prefill_ms?: number;

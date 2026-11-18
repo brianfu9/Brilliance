@@ -81,3 +81,12 @@ describe("scatter color helpers", () => {
     expect(shortSession("")).toBe("");
   });
 });
+
+describe("new-token buckets", () => {
+  it("splits at 2k, 4k, 8k and 32k; unknown is -1 and gray", async () => {
+    const { newTokensBucket, newTokensColor, OTHER_DARK } = await import("./scatterColor");
+    expect([1, 1999, 2000, 3999, 4000, 8000, 31999, 32000, 210000].map(newTokensBucket)).toEqual([0, 0, 1, 1, 2, 3, 3, 4, 4]);
+    expect(newTokensBucket(0)).toBe(-1);
+    expect(newTokensColor(-1, true)).toBe(OTHER_DARK);
+  });
+});

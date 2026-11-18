@@ -90,7 +90,7 @@ export function ConcurrencyHeat({ data }: { data: ConcurrencyData }) {
     for (const { k, iy, count } of counts.values()) {
       const y0 = lo + iy * step;
       const y1 = step > 0 ? y0 + step : y0;
-      cells.push({ x0: k - HALF, x1: k + HALF, y0, y1, cx: k, cy: (y0 + y1) / 2, count, accept: -1 });
+      cells.push({ x0: k - HALF, x1: k + HALF, y0, y1, cx: k, cy: (y0 + y1) / 2, count, accept: -1, size: -1 });
       if (count > maxCount) maxCount = count;
     }
     cells.sort((a, b) => a.count - b.count);

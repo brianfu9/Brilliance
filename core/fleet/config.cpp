@@ -559,12 +559,13 @@ int Reader::read_scheduler(const Item& sec, FleetConfig* out) {
         int s = RAD_OK;
         if      (k == "load-timeout")  s = duration(it, &out->load_timeout_ms);
         else if (k == "drain-timeout") s = duration(it, &out->drain_timeout_ms);
+        else if (k == "swap-hold")     s = duration(it, &out->swap_hold_ms);
         else if (k == "keepalive")     s = duration(it, &out->keepalive_ms);
         else if (k == "stuck-exit")    s = duration(it, &out->stuck_exit_ms);
         else if (k == "warm-up")       s = boolean(it, &out->warm_up);
         else {
             return fail(it.node, "scheduler." + k + " is not a scheduler key" +
-                                 suggest(k, { "load-timeout", "drain-timeout", "keepalive",
+                                 suggest(k, { "load-timeout", "drain-timeout", "swap-hold", "keepalive",
                                               "stuck-exit", "warm-up" }));
         }
         if (s < 0) return s;
@@ -1033,6 +1034,8 @@ void print_reference(FILE* to) {
         "\nscheduler:\n"
         "  load-timeout: DURATION               how long a request waits for its model (default 120s)\n"
         "  drain-timeout: DURATION              how long a model being evicted may finish requests (30s)\n"
+        "  swap-hold: DURATION                  a busy model finishes its work before a swap, up to this long into\n"
+        "                                       the waiting model's wait (0: the quantum alone)\n"
         "  keepalive: DURATION                  SSE comment interval while a request waits (10s)\n"
         "  stuck-exit: DURATION                 a device stuck this long ends the process (60s; 0 never)\n"
         "  warm-up: true|false                  fill free VRAM, then host RAM, with models at start (true)\n"

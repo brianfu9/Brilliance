@@ -366,6 +366,8 @@ private:
         std::atomic<int>                   op{ kIdle };
         std::atomic<bool>                  waiting{ false };   /* in make_room_waiting */
         std::atomic<bool>                  waiting_host{ false };   /* in load_host_room's wait */
+        /* (local) swap-hold: when this model began waiting for room (VRAM or host), 0 while it is not. */
+        std::atomic<uint64_t>              wait_since_ns{ 0 };
         /* Loaded by the warm-up and named by no request since (§8.6): its load takes room only
          * from free memory and other such models, and gives up quietly where there is none. */
         std::atomic<bool>                  warm{ false };
@@ -504,6 +506,8 @@ private:
      * instead of giving its cards back for each request of another (ping-pong). Four times what
      * coming back costs it, within [5 s, 30 s]. */
     bool   in_quantum(const Model& m, const server::Front::Activity& a, uint64_t now) const;
+    /* (local) in_quantum, or swap-hold: `m` is busy and `waiter` has waited less than swap-hold. */
+    bool   swap_held(const Model& m, const server::Front::Activity& a, const Model* waiter, uint64_t now) const;
     bool   take_from(Model& victim, const std::map<int, int64_t>& want, const std::string& why);
     void   unload(Model& m, int64_t drain_ms, const std::string& why);
     /* 1 when `want` left, 0 when less could leave (nothing more to page out), -1 when the model
@@ -866,7 +870,7 @@ std::vector<Resident> Fleet::residents(const Model* except) {
         r.priority = m.entry.priority;
         r.pin = m.kept();   /* Brilliance: a held model stays as a pinned one does */
         r.busy = a.leases > 0 || a.waiting > 0;
-        r.keep = in_quantum(m, a, now);
+        r.keep = swap_held(m, a, except, now);
         r.idle_s = a.last_used_ns && now > a.last_used_ns ? (double)(now - a.last_used_ns) * 1e-9 : 0;
         r.restore_s = m.parked ? std::max(m.restore_s, 0.1) : (m.load_s > 0 ? m.load_s : 5.0);
         v.push_back(r);
@@ -1294,6 +1298,15 @@ bool Fleet::in_quantum(const Model& m, const server::Front::Activity& a, uint64_
     return now > m.on_ns && (double)(now - m.on_ns) * 1e-9 < q;
 }
 
+bool Fleet::swap_held(const Model& m, const server::Front::Activity& a, const Model* waiter, uint64_t now) const {
+    if (in_quantum(m, a, now)) return true;
+    if (fc_.swap_hold_ms <= 0 || !waiter || m.parked || !m.resident || !m.engine || m.kept()) return false;
+    if (a.leases <= 0 && a.waiting <= 0) return false;
+    /* A demand that has not started its wait (a warm-up, a plan before the wait) holds for the full time. */
+    const uint64_t since = waiter->wait_since_ns.load(std::memory_order_relaxed);
+    return since == 0 || since > now || now - since < (uint64_t)fc_.swap_hold_ms * 1000000ull;
+}
+
 int Fleet::passing_on(const Model& m, const std::map<int, int64_t>& need) {
     const uint64_t now = rad_mono_ns();
     std::vector<server::Front::Activity> act(models_.size());
@@ -1310,12 +1323,25 @@ int Fleet::passing_on(const Model& m, const std::map<int, int64_t>& need) {
         else return 2;
     }
     for (size_t i = 0; i < models_.size(); ++i)
-        if (models_[i].get() != &m && near(models_[i]->cards) && in_quantum(*models_[i], act[i], now))
+        if (models_[i].get() != &m && near(models_[i]->cards) && swap_held(*models_[i], act[i], &m, now))
             return 2;
     for (const Reservation& r : reserved_)
         if (r.m != &m && r.claim > 0 && !r.m->starting.load() && near(r.cards)) return 2;
     return waiters ? 1 : 0;
 }
+
+/* (local) swap-hold's clock: the first of a model's waits for room starts it, and that wait's end clears it. */
+namespace {
+struct WaitClock {
+    std::atomic<uint64_t>& t;
+    bool mine = false;
+    explicit WaitClock(std::atomic<uint64_t>& at) : t(at) {
+        uint64_t zero = 0;
+        mine = t.compare_exchange_strong(zero, rad_mono_ns());
+    }
+    ~WaitClock() { if (mine) t.store(0); }
+};
+}  // namespace
 
 int Fleet::make_room_waiting(Model& m, const std::map<int, int64_t>& need, std::string* why,
                              const std::function<void()>& commit, int64_t max_ms) {
@@ -1325,6 +1351,7 @@ int Fleet::make_room_waiting(Model& m, const std::map<int, int64_t>& need, std::
     auto still_since = t0;
     bool said = false, closed_queues = false;
     const Raised flag(m.waiting);
+    const WaitClock clock(m.wait_since_ns);
     /* The cards' free figures at the last look. Memory a model gave back is counted free only as
      * the driver's wipe reaches it, some GiB a second: after the tens of GiB a large model's
      * room takes (every other model unloaded for MiniMax-H3) the figure rises for longer than
@@ -1697,6 +1724,7 @@ bool Fleet::load_host_room(Model& m, int64_t need, int64_t own, bool reserve) {
      * VRAM here, which what pins the memory may be waiting for, and the failed start lets go of it. */
     const int64_t tries = warm ? 1 : own == 0 ? std::max<int64_t>(fc_.load_timeout_ms / 200, 300) : 300;
     const Raised flag(m.waiting_host);
+    const WaitClock clock(m.wait_since_ns);
     for (int64_t i = 0; i < tries && !ok && !g_stop.load(); ++i) {
         /* As in load_op: without a load in flight beside this one the figure is exact, and parked
          * and idle models give their host memory at once. */
@@ -1811,7 +1839,7 @@ bool Fleet::make_host_room(int64_t need, const Model* keep, bool force, bool unl
                  * that has answered since it came on is idle. */
                 if (a.last_used_ns >= m->on_ns || now - m->on_ns > 10000000000ull)
                     idle.push_back(m.get());
-            } else if (take_busy && !in_quantum(*m, a, now)) {
+            } else if (take_busy && !swap_held(*m, a, keep, now)) {
                 busy.push_back(m.get());
             }
         }

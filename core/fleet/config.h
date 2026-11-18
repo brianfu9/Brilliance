@@ -110,6 +110,10 @@ struct FleetConfig {
     /* scheduler: */
     int64_t load_timeout_ms  = 120000;
     int64_t drain_timeout_ms = 30000;
+    /* (local) swap-hold: while another model waits for the cards, a model with requests open or queued keeps them
+     * and goes on taking its own requests, so a swap comes when it runs out of work -- up to this long into the
+     * other model's wait, after which the swap drains it (drain-timeout). 0: the quantum alone (upstream). */
+    int64_t swap_hold_ms     = 0;
     int64_t keepalive_ms     = 10000;
     /* A device that has advanced nothing for this long ends the process, so a restart policy can
      * bring the server back (dev_stuck_exit_ms); 0 never. */

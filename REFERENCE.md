@@ -196,6 +196,7 @@ Read by `core/fleet/config.cpp`; durations are `250ms`, `30s`, `30m` or `2h`. A 
 | `scheduler` | the fleet scheduler's level |  | map | operator | `core/fleet/config.cpp:59` |
 | `load-timeout` | under `scheduler:`: how long a request waits for its model to load | 120s | duration | operator | `core/fleet/config.cpp:560` |
 | `drain-timeout` | under `scheduler:`: how long a model being evicted may finish its requests | 30s | duration | operator | `core/fleet/config.cpp:561` |
+| `swap-hold` | under `scheduler:`: while another model waits, a busy model keeps the card until it has no work, up to this duration; 0 is off | 0 (off) | duration | operator | `core/fleet/config.cpp:562` |
 | `keepalive` | under `scheduler:`: the SSE comment interval while a request waits | 10s | duration | operator | `core/fleet/config.cpp:562` |
 | `stuck-exit` | under `scheduler:`: a device stuck this long ends the process; 0 never | 60s | duration | operator | `core/fleet/config.cpp:563` |
 | `warm-up` | under `scheduler:`: fill free VRAM, then host RAM, with models at start | true | true \| false | operator | `core/fleet/config.cpp:564` |

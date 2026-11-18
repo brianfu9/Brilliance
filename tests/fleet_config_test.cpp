@@ -333,6 +333,10 @@ TEST(scheduler_cards_and_groups) {
     fleet::FleetConfig off;
     CHECK_EQ(yload("scheduler: {stuck-exit: 0}\nmodels:\n  a: {model: /m/a.rad}\n", &off), RAD_OK);
     CHECK_EQ(off.stuck_exit_ms, 0);
+    CHECK_EQ(off.swap_hold_ms, 0);   /* (local) swap-hold: off unless the file sets it */
+    fleet::FleetConfig hold;
+    CHECK_EQ(yload("scheduler: {swap-hold: 10m}\nmodels:\n  a: {model: /m/a.rad}\n", &hold), RAD_OK);
+    CHECK_EQ(hold.swap_hold_ms, 600000);
     fleet::FleetConfig slow;
     CHECK_EQ(yload("scheduler: {stuck-exit: 5m}\nmodels:\n  a: {model: /m/a.rad}\n", &slow), RAD_OK);
     CHECK_EQ(slow.stuck_exit_ms, 300000);

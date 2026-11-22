@@ -2210,6 +2210,402 @@ TEST(a_held_request_lets_smaller_ones_pass_only_for_the_backfill_window) {
     CHECK_EQ(f.sch.metrics().preemptions, 0);
 }
 
+/* ================================================================== the claimant policy */
+/* --admit-claimant (PLAN-admit-line-jump §6.8): the frontmost big waiter held past its backfill
+ * window is asked before everything else; every other admission must not move the wall time its
+ * pool room was committed to it later. Pool 26 x 16 = 416 tokens, reserve 64: A (150 + 64) takes
+ * 14 blocks, B (200 + 64 of the 100 allowed) 17 — big, 2 x 17 > 26 — C (130 + 64) 13, not big.
+ *
+ * The window clock is held_us, stamped on the first kAdmitHold: a request must be HELD before it
+ * can cross the window, so each test holds its big waiter first, then sleeps, then steps. Finish
+ * estimates use the fallback rates (the fixture drives commit() directly and never runs the
+ * engine's step loop, so the EMAs stay cold): 50 ms per decode token, 500 us per prefill token —
+ * B's work is ~5.1 s, C's ~3.3 s, so gate margins are hundreds of ms against a few-ms wall time. */
+
+/* The claimant is asked first: B queued behind C, but when A finishes B is admitted and C — which
+ * alone fits the empty pool — is refused by the anchor gate for as long as B runs. */
+TEST(the_claimant_is_asked_before_earlier_waiters_and_starts_by_its_anchor) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(150, 64, /*priority=*/5);
+    for (int i = 0; i < 90 && f.sch.find(a)->output.size() < 60; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t c = f.submit(130, 64);   /* 13 blocks: held beside A's 14 */
+    const uint64_t b = f.submit(200, 100);  /* 17 blocks: big, held beside A's 14 */
+    CHECK(f.sch.step() != nullptr);         /* both held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));   /* past the window */
+
+    /* A has a few tokens left when B crosses the window: its anchor commits to A's finish. While
+     * A runs, neither C nor B fits, and C is gated (its ~3.2 s of work finishes long after). */
+    for (int i = 0; i < 10 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    CHECK_EQ(f.sch.metrics().claimants_total, 1);
+
+    /* A is done: B is admitted at the head of the walk, C (which fits the empty pool alone) is
+     * refused by the anchor gate while B runs. */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, 1);
+    CHECK(f.sch.metrics().claimant_gate_blocked >= 1);
+
+    for (int i = 0; i < 400 && (f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(c)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* A filler that fits is refused when it would move the claimant's committed anchor later: S
+ * (120 + 32, 10 blocks) fits beside A (14 + 10 <= 26), but at A's finish S still runs and its 10
+ * blocks leave only 26 - 17 - 10 < 0 room for B — past the anchor stamped when B crossed the
+ * window. */
+TEST(a_filler_that_would_delay_the_claimant_anchor_is_refused) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(150, 64, /*priority=*/5);
+    for (int i = 0; i < 90 && f.sch.find(a)->output.size() < 58; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t b = f.submit(200, 100);   /* held; big */
+    CHECK(f.sch.step() != nullptr);          /* B held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(f.sch.step() != nullptr);          /* B becomes the claimant; anchor stamped */
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().claimants_total, 1);
+
+    const uint64_t s = f.submit(120, 32);    /* fits beside A, but finishes after A */
+    for (int i = 0; i < 10 && f.sch.find(a)->state != ReqState::Finished; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Waiting);
+    }
+    CHECK(f.sch.metrics().claimant_gate_blocked >= 1);
+
+    /* A is done: B is admitted; S is still gated while B runs, and starts only after B. */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Waiting);
+
+    for (int i = 0; i < 400 && f.sch.find(s)->state != ReqState::Finished; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* The gate admits a filler whose own finish restores the room before the committed anchor: S
+ * (40 + 8, 3 blocks) finishes well before A does, so admitting it moves no finish that matters —
+ * the anchor stays at A's finish, inside the commitment. */
+TEST(a_filler_that_finishes_before_the_anchor_is_admitted) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(150, 64, /*priority=*/5);
+    for (int i = 0; i < 90 && f.sch.find(a)->output.size() < 58; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t b = f.submit(200, 100);   /* held; big */
+    CHECK(f.sch.step() != nullptr);          /* B held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(f.sch.step() != nullptr);          /* B becomes the claimant; anchor stamped */
+    f.commit_plain();
+
+    /* S is gated on the very next step: A's re-estimated finish then sits one measured token
+     * (50 ms) inside the committed anchor, so the gate passes. */
+    const uint64_t s = f.submit(40, 8);      /* finishes long before A */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK((int)f.sch.find(s)->state != (int)ReqState::Waiting);   /* admitted beside A */
+    CHECK_EQ(f.sch.metrics().claimant_gate_blocked, 0);
+
+    for (int i = 0; i < 400 && (f.sch.find(a)->state != ReqState::Finished ||
+                                f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(s)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* With the policy on but no big waiter past its window, the walk is exactly today's: in-window
+ * backfill and post-window head-of-line, no claimant ever stamped. */
+TEST(the_claimant_policy_is_inert_without_a_big_waiter) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(150, 64, /*priority=*/5);   /* 14 blocks */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    const uint64_t c = f.submit(130, 64);                   /* 13: held beside A, not big */
+    const uint64_t s = f.submit(40, 8);                     /* 3: fits, passes C in-window */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    CHECK((int)f.sch.find(s)->state != (int)ReqState::Waiting);
+
+    for (int i = 0; i < 400 && (f.sch.find(a)->state != ReqState::Finished ||
+                                f.sch.find(c)->state != ReqState::Finished ||
+                                f.sch.find(s)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().claimants_total, 0);
+    CHECK_EQ(f.sch.metrics().claimant_gate_blocked, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* --admit-claimant-min-pct: C (13 of 26 blocks) is not big at the default 50 (2 x 13 = 26, not
+ * more), so past its window it holds the line head-of-line and S, which fits beside A and finishes
+ * long before A, waits behind it. At 0 any held waiter claims: C becomes the claimant and S passes
+ * the anchor gate on the next step. Either way C starts when A finishes. */
+static void run_medium_waiter_claim(int64_t min_pct) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    f.cfg.admit_claimant_min_pct = min_pct;
+    CHECK_OK(f.start());
+
+    const uint64_t a = f.submit(150, 64, /*priority=*/5);   /* 14 blocks */
+    for (int i = 0; i < 90 && f.sch.find(a)->output.size() < 58; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t c = f.submit(130, 64);    /* 13 blocks: held beside A; big only at min_pct < 50 */
+    CHECK(f.sch.step() != nullptr);          /* C held here: held_us stamped */
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));   /* past the window */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().claimants_total, min_pct < 50 ? 1 : 0);
+
+    const uint64_t s = f.submit(40, 8);      /* 3 blocks; finishes long before A */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
+    if (min_pct < 50) {
+        CHECK((int)f.sch.find(s)->state != (int)ReqState::Waiting);   /* passed the anchor gate */
+        CHECK_EQ(f.sch.metrics().claimant_gate_blocked, 0);
+    } else {
+        CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Waiting);  /* head-of-line behind C */
+    }
+
+    for (int i = 0; i < 400 && (f.sch.find(a)->state != ReqState::Finished ||
+                                f.sch.find(c)->state != ReqState::Finished ||
+                                f.sch.find(s)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, min_pct < 50 ? 1 : 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+TEST(a_medium_waiter_holds_the_line_at_the_default_min_pct) { run_medium_waiter_claim(50); }
+TEST(a_medium_waiter_claims_at_min_pct_0_and_a_short_filler_passes) { run_medium_waiter_claim(0); }
+
+/* The post-walk compaction merges took_ into waiting_ by queue position, so it needs took_
+ * ascending. Under a claimant the walk admits in SPT order: F2 (3 blocks) is asked before F1
+ * (9) and both fit beside R (14) exactly — 14 + 3 + 9 = 26 — so one step takes them as
+ * took_ = [2, 1]. Unsorted, the merge drops the wrong entries and a running request stays in
+ * waiting_, where it is admitted a second time. */
+TEST(two_fillers_are_admitted_in_spt_order_in_one_claimant_step) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t r = f.submit(150, 64, /*priority=*/5);   /* 14 blocks */
+    for (int i = 0; i < 90 && f.sch.find(r)->output.size() < 28; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t b = f.submit(200, 100);   /* 17 blocks: big */
+    CHECK(f.sch.step() != nullptr);          /* B held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));   /* past the window */
+    CHECK(f.sch.step() != nullptr);          /* B becomes the claimant; anchor stamped */
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().claimants_total, 1);
+
+    const uint64_t f1 = f.submit(100, 32);   /* 9 blocks: ~1.65 s of estimated work */
+    const uint64_t f2 = f.submit(40, 8);     /* 3 blocks: ~0.42 s — asked before F1 */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    /* Both pass the gate one step after the stamp (R's re-estimated finish sits a measured token
+     * inside the committed anchor) and fit exactly; B still waits beside R. */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK((int)f.sch.find(f1)->state != (int)ReqState::Waiting);
+    CHECK((int)f.sch.find(f2)->state != (int)ReqState::Waiting);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, 0);
+    CHECK_EQ(f.sch.metrics().claimant_gate_blocked, 0);
+
+    for (int i = 0; i < 400 && (f.sch.find(r)->state != ReqState::Finished ||
+                                f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(f1)->state != ReqState::Finished ||
+                                f.sch.find(f2)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(r)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(f1)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(f2)->state, (int)ReqState::Finished);
+    /* R, F2, F1 and B — a second admission of a request already running would make this 5. */
+    CHECK_EQ(f.sch.metrics().admitted, 4);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, 1);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* A refused input leaves waiting_ mid-walk: its successors shift down one in every structure
+ * that holds queue positions — claim_order_ and took_ alike. F is admitted (took_ = [2]), then
+ * X, whose prompt fills the context, fails at position 1; without the shift took_ points past
+ * the end of the shrunken queue. */
+TEST(a_ctx_failure_after_an_admission_compacts_the_claimant_walk) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/250);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t r = f.submit(150, 64, /*priority=*/5);   /* 14 blocks */
+    for (int i = 0; i < 90 && f.sch.find(r)->output.size() < 28; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t b = f.submit(200, 100);   /* 17 blocks: big */
+    CHECK(f.sch.step() != nullptr);          /* B held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));   /* past the window */
+    CHECK(f.sch.step() != nullptr);          /* B becomes the claimant; anchor stamped */
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().claimants_total, 1);
+
+    const uint64_t x = f.submit(250, 40);    /* prompt fills the 250 context: fails its turn */
+    const uint64_t s = f.submit(40, 8);      /* 3 blocks: ~0.42 s — asked before X's ~2.1 s */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(x)->state, (int)ReqState::Failed);
+    CHECK((int)f.sch.find(s)->state != (int)ReqState::Waiting);   /* admitted past the failure */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+
+    for (int i = 0; i < 400 && (f.sch.find(r)->state != ReqState::Finished ||
+                                f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(s)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(r)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(s)->state, (int)ReqState::Finished);
+    /* R, S and B — a stale took_ entry re-admits S or reads the shrunken queue out of bounds. */
+    CHECK_EQ(f.sch.metrics().admitted, 3);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, 1);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
+/* S4 guard (§6.8): when the estimated rate overstates the real one, a runner's re-estimated
+ * finish slides earlier than the stamped anchor as the claimant waits — on the fixture's cold
+ * fallbacks by nearly a whole stamp per step of wait. The gate must still refuse a filler whose
+ * finish passes the committed anchor beyond that slide: R (14 blocks) is 91 tokens from done when
+ * B is stamped, and waits 60 steps; F (11 blocks, ~5.06 s of estimated work) then finishes ~0.5 s
+ * past the anchor — inside what a gate comparing against now would let through, outside the
+ * stamp's commitment. It fits beside R (14 + 11 <= 26), so only the gate keeps it out. */
+TEST(a_long_wait_does_not_erode_the_claimant_anchor_gate) {
+    Fixture f;
+    f.build(/*blocks=*/26, /*states=*/64);
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.admit_claimant = true;
+    CHECK_OK(f.start());
+
+    const uint64_t r = f.submit(150, 120, /*priority=*/5);   /* 14 blocks */
+    for (int i = 0; i < 90 && f.sch.find(r)->output.size() < 28; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    const uint64_t b = f.submit(200, 100);   /* 17 blocks: big */
+    CHECK(f.sch.step() != nullptr);          /* B held here: held_us stamped */
+    f.commit_plain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));   /* past the window */
+    CHECK(f.sch.step() != nullptr);          /* B becomes the claimant; anchor stamped */
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().claimants_total, 1);
+
+    for (int i = 0; i < 60; ++i) {           /* the claimant waits; R runs on */
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+        CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    }
+
+    const uint64_t fl = f.submit(110, 100);  /* 11 blocks: ~5.06 s of estimated work */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(fl)->state, (int)ReqState::Waiting);   /* refused by the gate */
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK(f.sch.metrics().claimant_gate_blocked >= 1);
+
+    for (int i = 0; i < 400 && (f.sch.find(r)->state != ReqState::Finished ||
+                                f.sch.find(b)->state != ReqState::Finished ||
+                                f.sch.find(fl)->state != ReqState::Finished); ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(r)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Finished);
+    CHECK_EQ((int)f.sch.find(fl)->state, (int)ReqState::Finished);
+    CHECK_EQ(f.sch.metrics().admitted, 3);
+    CHECK_EQ(f.sch.metrics().claimant_admitted, 1);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+}
+
 /* The gate when the running set drains: B and C were both held behind A, and each fits the empty
  * pool alone but not beside the other. The step after A finishes must admit one of them, not both:
  * this step's admissions join running_ only after the walk, so a gate that is skipped while
@@ -9655,5 +10051,43 @@ TEST(adaptive_depth_rows_are_issued_ahead_in_a_suffix_deployment_unless_a_sequen
             CHECK_EQ(q[0], 3);   /* 1 + the 2 drafts of one chain */
             CHECK_EQ(q[1], 4);   /* 1 + the 3 of the other */
         }
+    }
+}
+
+/* Elastic KV (Brilliance): fresh_fits must count recallable flex room (held_blocks + available_blocks)
+ * so a pool shrunk below its carve still admits and grows when flex room exists, and holds when the
+ * fleet has no flex room left (e.g. another model occupies the card). */
+TEST(kv_fit_gate_uses_elastic_capacity_with_flex_room) {
+    /* Case 1: live < carve (40 unbacked of 64 blocks = 24 live), plenty of flex room -> NOT held. */
+    {
+        Fixture f;
+        f.build(/*blocks=*/64, /*states=*/8, /*max_tok=*/512, /*max_ctx=*/1024);
+        f.cfg.admit_kv_reserve = 64;   /* 4 blocks reserve (block_size=16) */
+        CHECK_OK(f.start());
+        f.kv.unbacked = 40;
+        f.kv.flex_room_blocks = -1;    /* fleet can return all 40 unbacked blocks */
+        f.submit(256, 64);             /* 16 + 4 = 20 blocks */
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(1);
+        f.submit(256, 64);             /* 20 + 20 = 40 blocks: > 24 live, <= 64 cap -> admitted */
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.metrics().admit_kv_held, 0);
+        CHECK_EQ((int)f.sch.metrics().running, 2);
+    }
+    /* Case 2: live < carve (40 unbacked of 64 = 24 live), flex room == 0 -> held. */
+    {
+        Fixture f;
+        f.build(/*blocks=*/64, /*states=*/8, /*max_tok=*/512, /*max_ctx=*/1024);
+        f.cfg.admit_kv_reserve = 64;
+        CHECK_OK(f.start());
+        f.kv.unbacked = 40;
+        f.kv.flex_room_blocks = 0;     /* another model holds the card: cap == 24 live */
+        f.submit(256, 64);             /* 20 blocks: idle admits */
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(1);
+        f.submit(256, 64);             /* 20 + 20 = 40 > 24 cap -> held */
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.metrics().admit_kv_held, 1);
+        CHECK_EQ((int)f.sch.metrics().running, 1);
     }
 }

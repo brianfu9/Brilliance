@@ -179,6 +179,9 @@ void Metrics::sample(const SchedMetrics& m) {
     c_preemptions_.advance_to(m.preemptions);
     c_preempt_forced_.advance_to(m.preempt_forced);
     c_admit_kv_held_.advance_to(m.admit_kv_held);
+    c_claimants_total_.advance_to(m.claimants_total);
+    c_claimant_admitted_.advance_to(m.claimant_admitted);
+    c_claimant_gate_blocked_.advance_to(m.claimant_gate_blocked);
     c_steps_.advance_to(m.steps);
     c_steps_prefill_.advance_to(m.steps_prefill);
     c_steps_mixed_.advance_to(m.steps_mixed);
@@ -349,6 +352,15 @@ std::string Metrics::render() const {
     w.counter("radiance:admit_kv_held_total",
               "Requests admission held in the queue until the KV pool could hold their whole "
               "prompt (--admit-kv-reserve).", L, c_admit_kv_held_.get());
+    w.counter("radiance:claimants_total",
+              "Big waiters that crossed their hold window and became claimants with a committed "
+              "anchor (--admit-claimant).", L, c_claimants_total_.get());
+    w.counter("radiance:claimant_admitted_total",
+              "Claimants admitted at the head of the walk, ungated (--admit-claimant).",
+              L, c_claimant_admitted_.get());
+    w.counter("radiance:claimant_gate_blocked_total",
+              "Fillers refused because they would move a claimant's committed anchor later "
+              "(--admit-claimant).", L, c_claimant_gate_blocked_.get());
 
     w.help("vllm:request_success_total",
            "Count of successfully processed requests.", "counter");

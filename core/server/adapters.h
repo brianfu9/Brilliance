@@ -148,8 +148,13 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.preemptions = m.preemptions;
     o.preempt_forced = m.preempt_forced;
     o.admit_kv_held = m.admit_kv_held;
+    o.claimants_total = m.claimants_total;
+    o.claimant_admitted = m.claimant_admitted;
+    o.claimant_gate_blocked = m.claimant_gate_blocked;
     o.admit_kv_reserve = m.admit_kv_reserve;
     o.admit_backfill_ms = m.admit_backfill_ms;
+    o.admit_claimant = m.admit_claimant;
+    o.admit_claimant_min_pct = m.admit_claimant_min_pct;
     o.total_requests = m.admitted;
     o.steps = m.steps;
     o.steps_prefill = m.steps_prefill;  o.steps_mixed = m.steps_mixed;

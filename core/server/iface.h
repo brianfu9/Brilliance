@@ -137,9 +137,15 @@ struct SchedMetrics {
     int64_t preemptions = 0;
     int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
     int64_t admit_kv_held = 0;        /* --admit-kv-reserve: requests held for KV room */
-    /* The queue policy as configured: --admit-kv-reserve, --admit-backfill-ms. */
+    /* --admit-claimant: claimants stamped and admitted, fillers refused by the anchor gate. */
+    int64_t claimants_total = 0;
+    int64_t claimant_admitted = 0;
+    int64_t claimant_gate_blocked = 0;
+    /* The queue policy as configured: --admit-kv-reserve, --admit-backfill-ms, --admit-claimant. */
     int64_t admit_kv_reserve = 0;
     int64_t admit_backfill_ms = 0;
+    int64_t admit_claimant = 0;
+    int64_t admit_claimant_min_pct = 0;
     int64_t total_requests = 0;
     /* Engine steps: one forward pass plus any draft rounds after it. With speculation a step
      * emits more than one token, so step time cannot be derived from tokens per second. */

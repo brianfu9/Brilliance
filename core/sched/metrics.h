@@ -20,6 +20,8 @@ struct SchedMetrics {
     /* The queue policy, as configured, so a client can draw what admission decides. */
     int64_t admit_kv_reserve = 0;
     int64_t admit_backfill_ms = 0;
+    int64_t admit_claimant = 0;
+    int64_t admit_claimant_min_pct = 0;
 
     /* Cumulative counters. Monotonic, so a scraper can rate() them. */
     int64_t admitted = 0;
@@ -32,6 +34,11 @@ struct SchedMetrics {
     int64_t preempt_forced = 0;
     /* --admit-kv-reserve: requests admission held at least once for KV room. */
     int64_t admit_kv_held = 0;
+    /* --admit-claimant: claimants first stamped (a big waiter crossed its hold window and got its
+     * anchor), claimants admitted, and fillers refused by the claimant's anchor gate. */
+    int64_t claimants_total = 0;
+    int64_t claimant_admitted = 0;
+    int64_t claimant_gate_blocked = 0;
     int64_t steps = 0;
 
     /* Steps by shape. `steps_mixed` counts steps carrying both a prefill chunk and decode rows.

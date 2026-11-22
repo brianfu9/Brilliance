@@ -55,6 +55,9 @@ struct SchedReq {
                                   * whole-recompute admission wait (--preempt-wait-ms). */
     int64_t  held_us = 0;        /* when admission first held it for KV room (--admit-kv-reserve);
                                   * 0 if never. Bounds how long others may pass it (--admit-backfill-ms). */
+    int64_t  claim_anchor_us = 0;   /* --admit-claimant: the wall time its pool room was committed to
+                                     * it, stamped once when it first became the frontmost claimant.
+                                     * 0 if never a claimant. */
     uint8_t  wait_why = 0;       /* Scheduler::WaitWhy: what the last admission walk said, for
                                   * the live request table only */
 
@@ -975,6 +978,24 @@ private:
     /* The blocks fresh_fits counts for `s` in paged group `g`: a `fresh` request's whole prompt,
      * or what an admitted one holds or still needs, plus its output reserve. */
     int64_t gate_blocks(const SchedReq& s, size_t g, bool fresh) const;
+    /* --admit-claimant: is `s` big on the binding group — does its whole commitment alone take
+     * more than --admit-claimant-min-pct of that pool? (Default 50: the model's 2w > T.) */
+    bool claim_is_big(const SchedReq& s) const;
+    /* The wall time in µs at which `s` finishes if admitted now: its remaining prompt at the
+     * prefill rate plus its remaining output at the decode rate. Both rates are EMAs over
+     * completed steps (step_finished feeds them on every timed step), with slow fallbacks before
+     * the first sample — 0.5 ms/prefill token and 50 ms/decode token, i.e. ~2k and ~20 tok/s.
+     * The production engine warms them quickly; a scheduler driven without its step loop (tests)
+     * stays on the fallbacks. Note the estimate is only as good as the rates: when a rate
+     * overstates the real per-token time by k, a stamped anchor erodes at (k−1)·t for t seconds
+     * of claimant wait — see the gate's comment and §6.8 S4. */
+    int64_t claim_est_finish_us(const SchedReq& s) const;
+    /* The earliest wall time in µs at or after `now` at which the binding pool leaves room for
+     * `c`'s whole commitment, given the profile running_ plus this walk's admissions (took_) plus
+     * `extra` when non-null: the candidates are now and each entry's estimated finish, in order,
+     * and an entry still running at t (finish > t) counts its full commitment. The sentinel when
+     * no candidate works. (anchorOf in the Lean model.) */
+    int64_t claim_anchor_of(const SchedReq& c, const SchedReq* extra, int64_t now) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
@@ -991,6 +1012,20 @@ private:
     static constexpr int kAdmitHold = 2;
     /* The queue positions one step's admission took, kept to reuse the allocation. */
     std::vector<size_t> took_;
+    /* --admit-claimant (PLAN-admit-line-jump §6.8): the binding full-attention group — the paged
+     * full group with the fewest blocks; -1 when there is none, which leaves the policy inert. */
+    int32_t  claim_group_ = -1;
+    /* The claimant walk's order: positions in waiting_, claimant first, the rest by estimated
+     * finish (SPT). Reused across steps, like took_. */
+    std::vector<size_t> claim_order_;
+    /* Each waiting request's estimated finish, keyed by its queue position. Computed once per
+     * step so the SPT sort compares fixed numbers — a comparator that re-estimated on every
+     * comparison would read mono_us() between calls and stop being a strict weak ordering. */
+    std::vector<int64_t> claim_keys_;
+    struct ClaimEntry { int64_t blocks = 0; int64_t finish_us = 0; };
+    /* The anchor computation's profile: running_ plus this walk's admissions, plus the candidate
+     * filler. Reused across gates within a step. */
+    mutable std::vector<ClaimEntry> claim_profile_;
     /* A step's prefill entries while step() moves its decode entries first; reserved at init,
      * since std::stable_partition would take a temporary buffer from the allocator every step. */
     std::vector<StepEntry> part_;

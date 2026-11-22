@@ -81,6 +81,24 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     has_linear_state_ = false;
     for (const auto& g : kvgeom_.g) if (!g.paged) has_linear_state_ = true;
 
+    /* --admit-claimant: the pool the policy measures against — the binding full group, the paged
+     * one with the fewest blocks. Window pools never bind (fresh_fits), and a model with no full
+     * group has nothing to protect, so the policy stays inert. The group index is fixed here; its
+     * elastic capacity (held_blocks + available_blocks) is read dynamically per step. */
+    claim_group_ = -1;
+    int64_t claim_pool = 0;
+    for (size_t i = 0; i < kvgeom_.g.size(); ++i) {
+        if (kvgeom_.g[i].kind != RAD_KV_FULL) continue;
+        const int64_t t = kv->total_blocks((int32_t)i);
+        if (t <= 0) continue;
+        if (claim_group_ < 0 || t < claim_pool) { claim_group_ = (int32_t)i; claim_pool = t; }
+    }
+    /* The claimant walk's scratch, reserved once: the step path takes no allocations. Queue
+     * depths past this reallocate once on growth and hold the capacity. */
+    claim_order_.reserve(1024);
+    claim_keys_.reserve(1024);
+    claim_profile_.reserve(1024);
+
     /* R-SWA: which groups carry runtime per-sequence windows, and the W they arm a sequence
      * with. Empty unless the engine declared one (KVManager::declare_runtime_window), so a model
      * with a fixed window (gemma4) takes none of the runtime-window paths. */
@@ -475,6 +493,7 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
      * it zero for the same reason -- a stale stamp would read as an earlier admission. */
     s.admitted_us = 0;
     s.held_us = 0;
+    s.claim_anchor_us = 0;
     s.slot = slot;
     s.card = -1;
     s.running = false;
@@ -2090,6 +2109,93 @@ bool Scheduler::fresh_fits(const SchedReq& s) const {
     return true;
 }
 
+/* ------------------------------------------------------------------ the claimant policy */
+/* --admit-claimant (PLAN-admit-line-jump §6.8, "lindsay"): the frontmost big waiter held past its
+ * backfill window is asked before everything else, ungated; every other admission must not move
+ * the wall time its pool room was committed to it later. The model's pool T and job weight w are
+ * the binding group's blocks and a request's whole commitment (gate_blocks); its durations are
+ * wall-time estimates from the measured step costs. */
+
+bool Scheduler::claim_is_big(const SchedReq& s) const {
+    if (claim_group_ < 0 || !s.req) return false;
+    const int64_t total = kv_->total_blocks(claim_group_);
+    const int64_t cap = std::min(total, kv_->held_blocks(claim_group_) + kv_->available_blocks(claim_group_));
+    /* --admit-claimant-min-pct: 50 is the model's 2w > T; 0 is any held waiter (w > 0). */
+    return 100 * gate_blocks(s, (size_t)claim_group_, true) >
+           cfg_.admit_claimant_min_pct * cap;
+}
+
+int64_t Scheduler::claim_est_finish_us(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t now = mono_us();
+    /* seq_len, not prompt: a request back from preemption re-prefills prompt ++ output. */
+    const int64_t rem_prefill = std::max<int64_t>(0, s.seq_len() - r.n_computed);
+    /* The output cap: the request's own, or what the context leaves when it names none. A
+     * request that names neither may run to EOS, which no finite estimate bounds; 1024 tokens is
+     * the horizon assumed (most generations end well inside it), so an uncapped request commits
+     * ~52 s of decode at the fallback rate instead of finishing "now". */
+    const int64_t cap = r.max_tokens > 0 ? r.max_tokens
+        : (ctx_limit_ > 0 ? ctx_limit_ - (int64_t)r.prompt.size() : 1024);
+    const int64_t rem_decode = std::max<int64_t>(0, cap - (int64_t)r.output.size());
+    /* One decode step yields at least one token per sequence, so the step's wall time bounds this
+     * sequence's next token; a prefill chunk takes the chunk step's wall time for its tokens.
+     * The fallbacks are deliberately slow — 20 tok/s decode (measured ~68) and 2k tok/s prefill
+     * (measured ~2.3k) — so a cold estimate over-commits the anchor rather than under-committing
+     * it: an underestimate lets the gate admit a filler whose true finish passes the commitment.
+     * step_finished feeds the EMAs on every timed step, so in production they warm within a few
+     * steps and the fallbacks only cover startup and a decode-only history; note_step_cost is the
+     * test-visible door into the same lock. When the chunk EMA does warm, dividing by the
+     * configured chunk assumes full chunks — optimistic for budget-cut ones, bounded by the
+     * prefill share of any one request's work. */
+    const double dec_s = ema_decode_s_ > 0.0 ? ema_decode_s_ : 0.05;
+    const int64_t chunk = cfg_.busy_prefill_chunk > 0 ? cfg_.busy_prefill_chunk : cfg_.max_tok;
+    const double pre_s = ema_chunk_s_ > 0.0 ? ema_chunk_s_ / (double)std::max<int64_t>(1, chunk)
+                                            : 5e-4;
+    return now + (int64_t)((rem_prefill * pre_s + rem_decode * dec_s) * 1e6);
+}
+
+int64_t Scheduler::claim_anchor_of(const SchedReq& c, const SchedReq* extra, int64_t now) const {
+    if (claim_group_ < 0) return INT64_MAX;
+    const size_t g = (size_t)claim_group_;
+    const int64_t total = kv_->total_blocks(claim_group_);
+    const int64_t cap = std::min(total, kv_->held_blocks(claim_group_) + kv_->available_blocks(claim_group_));
+    const int64_t wc = gate_blocks(c, g, true);
+    if (wc >= total) return INT64_MAX;   /* never fits the carve; the gate then passes everything */
+    if (wc > cap) return extra ? INT64_MAX : 0;   /* temporarily shrunk below claimant: hold fillers until flex returns */
+    claim_profile_.clear();
+    for (int32_t slot : running_) {
+        const SchedReq& rs = *reqs_[(size_t)slot];
+        if (rs.req) claim_profile_.push_back({gate_blocks(rs, g, false), claim_est_finish_us(rs)});
+    }
+    /* This step's earlier admissions join running_ only after the walk. */
+    for (size_t at : took_) {
+        const SchedReq& t = *reqs_[(size_t)waiting_[at]];
+        if (t.req) claim_profile_.push_back({gate_blocks(t, g, false), claim_est_finish_us(t)});
+    }
+    if (extra && extra->req)
+        claim_profile_.push_back({gate_blocks(*extra, g, true), claim_est_finish_us(*extra)});
+    /* Room only opens at finish times, and an entry still running at t (finish > t) counts in
+     * full: the sum is monotone in t, so the first working candidate is now or a finish. */
+    std::sort(claim_profile_.begin(), claim_profile_.end(),
+              [](const ClaimEntry& a, const ClaimEntry& b) { return a.finish_us < b.finish_us; });
+    int64_t used = 0;
+    for (const ClaimEntry& p : claim_profile_)
+        if (now < p.finish_us) used += p.blocks;
+    if (used <= cap - wc) return now;
+    size_t i = 0;
+    while (i < claim_profile_.size()) {
+        const int64_t f = claim_profile_[i].finish_us;
+        if (f <= now) { ++i; continue; }
+        /* Every entry finishing at f leaves the pool together. */
+        while (i < claim_profile_.size() && claim_profile_[i].finish_us == f) {
+            used -= claim_profile_[i].blocks;
+            ++i;
+        }
+        if (used <= cap - wc) return f;
+    }
+    return INT64_MAX;
+}
+
 bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
     if (!s.req || s.req->state != ReqState::Preempted) return false;
     /* 0 means fall back on the next step; a timed request must have been preempted before. */
@@ -2549,17 +2655,71 @@ const RadBatch* Scheduler::step() {
         took_.clear();
         /* Until the walk says otherwise, a waiting request was not reached this step. */
         for (int32_t w : waiting_) reqs_[(size_t)w]->wait_why = kWaitQueued;
+
+        /* --admit-claimant (PLAN-admit-line-jump §6.8): the frontmost big waiter held past its
+         * backfill window is this step's claimant. It is asked first, ungated; every other
+         * admission must not move the wall time its pool room was committed to it later. Without
+         * a claimant the walk below is exactly today's: queue order, in-window backfill, and a
+         * post-window hold that stops it. */
+        int32_t claimant = -1;
+        size_t cpos = 0;
+        if (cfg_.admit_claimant && cfg_.admit_backfill_ms > 0) {
+            for (size_t k = 0; k < waiting_.size(); ++k) {
+                const SchedReq& s = *reqs_[(size_t)waiting_[k]];
+                if (claim_is_big(s) && s.held_us != 0 &&
+                    mono_us() - s.held_us >= cfg_.admit_backfill_ms * 1000) {
+                    claimant = waiting_[k];
+                    cpos = k;
+                    break;
+                }
+            }
+        }
+        bool lindsay = claimant >= 0;
+        if (lindsay) {
+            SchedReq& cs = *reqs_[(size_t)claimant];
+            if (cs.claim_anchor_us == 0) {
+                /* First claim: commit the room now, from the running profile alone. While anything
+                 * runs the anchor is finite — its latest candidate is past every runner's finish —
+                 * and it never moves later under gated admissions (the Lean model's invariant).
+                 * It persists across preemption on purpose: a preempted claimant re-claims on its
+                 * next step and gates fillers against the old anchor until it runs again —
+                 * maximally protective, at the cost of fillers while it waits for its
+                 * whole-recompute gate (PLAN §7.5). */
+                cs.claim_anchor_us = claim_anchor_of(cs, nullptr, mono_us());
+                if (cs.claim_anchor_us != 0) ++m_.claimants_total;
+            }
+            /* Claimant first, then the rest by estimated finish — SPT, the order the policy was
+             * measured in (PLAN §6.7: FIFO gives up almost all of its gain). Keys are computed
+             * once: re-estimating inside the comparator would read mono_us() between calls and
+             * break strict weak ordering. The position tie-break keeps it stable, and std::sort
+             * takes no temporary buffer (stable_sort's would allocate on every lindsay step). */
+            claim_order_.resize(waiting_.size());
+            claim_keys_.resize(waiting_.size());
+            for (size_t k = 0; k < waiting_.size(); ++k) {
+                claim_order_[k] = k;
+                claim_keys_[k] = claim_est_finish_us(*reqs_[(size_t)waiting_[k]]);
+            }
+            std::swap(claim_order_[0], claim_order_[cpos]);
+            std::sort(claim_order_.begin() + 1, claim_order_.end(),
+                [&](size_t a, size_t b) {
+                    return claim_keys_[a] != claim_keys_[b] ? claim_keys_[a] < claim_keys_[b] : a < b;
+                });
+        }
         size_t at = 0;
         bool reclaimed_idle_states = false;
-        while (at < waiting_.size() &&
+        /* close_request can shrink waiting_ mid-walk (a refused input), so the bound is
+         * re-evaluated every iteration; in lindsay mode claim_order_ is compacted in lockstep. */
+        while ((lindsay ? at < claim_order_.size() : at < waiting_.size()) &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && budget > 0) {
             /* A step planned for one prefill holds that one (span_now_ above). */
             if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
-            int32_t slot = waiting_[at];
+            const size_t pos = lindsay ? claim_order_[at] : at;
+            int32_t slot = waiting_[pos];
             SchedReq& s = *reqs_[(size_t)slot];
             /* Generation reserves one position after the prompt. An embedding consumes just
              * the prompt, so its exact context boundary fits without a generation slot.
-             * close_request removes a refused input from waiting_, so `at` names the next one. */
+             * close_request removes a refused input from waiting_, so `at` names the next one;
+             * the claimant order tracks the compaction. */
             if (ctx_limit_ > 0 &&
                 (s.seq_len() > ctx_limit_ || (!s.req->embed && s.seq_len() == ctx_limit_))) {
                 RAD_WARN("request %llu failed: %lld tokens leave no room in a %lld-token context",
@@ -2567,6 +2727,20 @@ const RadBatch* Scheduler::step() {
                          (long long)ctx_limit_);
                 close_request(s, ReqState::Failed, "context_length_exceeded", false, true,
                               RAD_E_FULL, "it leaves no room in the context");
+                if (lindsay) {
+                    /* The failed request leaves waiting_: its successors shift down one, and it
+                     * drops out of the walk order at index `at`, where pos was read. took_ holds
+                     * queue positions too, so it shifts with them. */
+                    for (size_t& q : claim_order_) if (q > pos) --q;
+                    claim_order_.erase(claim_order_.begin() + (long)at);
+                    for (size_t& q : took_) if (q > pos) --q;
+                    if (slot == claimant) {
+                        /* The claimant is gone: the rest of the walk is today's queue order, and
+                         * claim_order_ is not read again once lindsay is false. */
+                        lindsay = false;
+                        claimant = -1;
+                    }
+                }
                 continue;
             }
             /* Media first: a request whose items are not encoded keeps its place and the next is
@@ -2574,9 +2748,10 @@ const RadBatch* Scheduler::step() {
             if (s.req->media && !media_ready(s)) { s.wait_why = kWaitMedia; ++at; continue; }
             /* Leave one share for the next queued request when there is one and a slot for it
              * (busy_cap). Embed inputs are whole-or-nothing, so a share could only turn their
-             * admission into a refusal. */
+             * admission into a refusal. "Next" is walk order: claim_order_ under a claimant. */
             const int64_t areserve =
-                share_step && !s.req->embed && at + 1 < waiting_.size() &&
+                share_step && !s.req->embed &&
+                at + 1 < (lindsay ? claim_order_.size() : waiting_.size()) &&
                 (int64_t)plan_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
                     ? share_tok : 0;
             admit_full_ = 0;
@@ -2585,11 +2760,36 @@ const RadBatch* Scheduler::step() {
             admission_reclaim_pending_ = false;
             const int64_t mixed_target_shares = mixed_target_active_
                 ? std::min<int64_t>(
-                    (int64_t)waiting_.size() - (int64_t)at - 1,
+                    (int64_t)(lindsay ? claim_order_.size() : waiting_.size()) - (int64_t)at - 1,
                     std::min<int64_t>(
                         cfg_.max_seqs - (int64_t)plan_.e.size() - 1,
                         (int64_t)free_cards_.size() - 1))
                 : 0;
+            /* --admit-claimant: a filler that would be admitted is asked of the claimant's anchor
+             * before it commits anything, so a refusal costs nothing. The profile includes this
+             * walk's admissions so far — the claimant among them when it was admitted earlier.
+             * The comparison is zero-tolerance on purpose: both sides estimate the same wall
+             * time. When the estimated per-token rate e overstates the real one τ by k = e/τ, a
+             * runner's re-estimated finish slides earlier than the stamped anchor by (k−1)·t for
+             * t seconds waited — so a filler may delay the claimant by up to ~t(1 − 1/k) real
+             * seconds past the runner's true finish. The EMAs are fed on every timed step, so in
+             * production k ≈ 1 and the erosion vanishes; on the cold fallbacks (k ≈ 3.4 against
+             * measured decode) it grows at ~0.7·t — startup only, since a claimant needs a held
+             * big waiter and the first steps warm the rates. A gated filler is refused before
+             * admit_one, so held_us is never stamped: a big waiter behind the claimant cannot
+             * cross the window — and become a claimant — while the first is gated; at most one
+             * claimant at a time, as in the model. claimant_gate_blocked also counts fillers that
+             * would not have fit anyway: it measures gate activity, not lost throughput. */
+            if (lindsay && slot != claimant) {
+                const SchedReq& cs = *reqs_[(size_t)claimant];
+                if (!cs.claim_anchor_us ||
+                    claim_anchor_of(cs, &s, mono_us()) > cs.claim_anchor_us) {
+                    s.wait_why = kWaitBehind;
+                    ++m_.claimant_gate_blocked;
+                    ++at;
+                    continue;
+                }
+            }
             const int as = admit_one(s, budget, areserve,
                                      std::max<int64_t>(0, mixed_target_shares));
             /* An idle engine that cannot start this request will not be able to on the next
@@ -2625,12 +2825,17 @@ const RadBatch* Scheduler::step() {
                 continue;
             }
             /* A held request lets smaller ones behind it in, for --admit-backfill-ms; after
-             * that nothing passes it, so the pool drains until it fits. */
+             * that nothing passes it, so the pool drains until it fits. With a claimant there is
+             * no head of line: it is asked first every step and its guarantee is the anchor, so a
+             * held request — claimant or filler — is simply skipped. */
             if (as == kAdmitHold) {
                 s.wait_why = kWaitKvHold;
-                if (cfg_.admit_backfill_ms > 0 &&
-                    mono_us() - s.held_us < cfg_.admit_backfill_ms * 1000) { ++at; continue; }
-                for (size_t k = at + 1; k < waiting_.size(); ++k)
+                if (lindsay || (cfg_.admit_backfill_ms > 0 &&
+                                mono_us() - s.held_us < cfg_.admit_backfill_ms * 1000)) {
+                    ++at;
+                    continue;
+                }
+                for (size_t k = pos + 1; k < waiting_.size(); ++k)
                     reqs_[(size_t)waiting_[k]]->wait_why = kWaitBehind;
                 break;
             }
@@ -2672,14 +2877,38 @@ const RadBatch* Scheduler::step() {
                          (unsigned long long)s.req->id, rad_strerror(as));
                 close_request(s, ReqState::Failed, "preempt_admission", false, true, as,
                               "overdue preempted prefill could not be admitted on an idle engine");
+                if (lindsay) {
+                    for (size_t& q : claim_order_) if (q > pos) --q;
+                    claim_order_.erase(claim_order_.begin() + (long)at);
+                    for (size_t& q : took_) if (q > pos) --q;
+                    if (slot == claimant) {
+                        lindsay = false;
+                        claimant = -1;
+                    }
+                }
                 continue;
             }
-            if (as < 0) {                          /* head of line: do not admit behind it */
+            if (as < 0) {
                 s.wait_why = kWaitKvRoom;
-                for (size_t k = at + 1; k < waiting_.size(); ++k)
-                    reqs_[(size_t)waiting_[k]]->wait_why = kWaitBehind;
-                break;
+                /* Head of line: do not admit behind it — unless a claimant is being protected, in
+                 * which case the walk backfills past the refusal (a smaller request may survive
+                 * it), except when no card is left for anyone. */
+                if (!lindsay || free_cards_.empty()) {
+                    /* The requests behind are the walk's remainder; in queue order that would
+                     * mark already-admitted entries and miss earlier-queue ones walked later. */
+                    if (lindsay) {
+                        for (size_t k = at + 1; k < claim_order_.size(); ++k)
+                            reqs_[(size_t)waiting_[claim_order_[k]]]->wait_why = kWaitBehind;
+                    } else {
+                        for (size_t k = pos + 1; k < waiting_.size(); ++k)
+                            reqs_[(size_t)waiting_[k]]->wait_why = kWaitBehind;
+                    }
+                    break;
+                }
+                ++at;
+                continue;
             }
+            if (slot == claimant) ++m_.claimant_admitted;
             if (admit_full_ > s.sched_tokens && capped_at < 0) {
                 capped_at = (int32_t)plan_.e.size();
                 capped_full = admit_full_;
@@ -2718,10 +2947,14 @@ const RadBatch* Scheduler::step() {
                 mixed_target_prefill_planned_ += s.sched_tokens;
             }
             budget -= s.sched_tokens;
-            took_.push_back(at);
+            took_.push_back(pos);
             ++at;
         }
         if (!took_.empty()) {
+            /* Under a claimant the walk admits in SPT order, so took_ is not ascending; the merge
+             * below walks waiting_ in queue order and needs it. Knob-off it is already ascending
+             * (queue order), where this is a no-op. */
+            std::sort(took_.begin(), took_.end());
             for (size_t i : took_) queue_insert(running_, waiting_[i]);
             size_t w = 0, k = 0;
             for (size_t i = 0; i < waiting_.size(); ++i) {
@@ -3456,8 +3689,13 @@ void Scheduler::step_finished() {
     /* The window ages by all elapsed time, idle included; only the busy part is added as time the
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
-    /* --prefill-interleave auto's two step costs (interleave_steps). */
-    if (wall > 0 && cfg_.prefill_interleave < 0)
+    /* The two step costs: --prefill-interleave auto's interleave_steps, and the claimant gate's
+     * finish estimates. Fed on every timed step — in non-auto modes the interleave reader ignores
+     * them (it returns the configured number first), so this only warms the claimant estimator:
+     * a gate running on the cold fallbacks would let its anchor erode with the claimant's wait
+     * time, because the re-estimated runner finishes slide earlier than the stamped one at
+     * (e/τ − 1) per second waited, e and τ the estimated and real per-token rates. */
+    if (wall > 0)
         step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
@@ -4091,6 +4329,8 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.preempted_waiting = 0;
     m.admit_kv_reserve  = cfg_.admit_kv_reserve;
     m.admit_backfill_ms = cfg_.admit_backfill_ms;
+    m.admit_claimant    = cfg_.admit_claimant ? 1 : 0;
+    m.admit_claimant_min_pct = cfg_.admit_claimant_min_pct;
     for (int32_t slot : waiting_)
         if (reqs_[(size_t)slot]->req->state == ReqState::Preempted) ++m.preempted_waiting;
 

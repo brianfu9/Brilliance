@@ -97,6 +97,14 @@ static const Flag g_flags[] = {
     { "--admit-backfill-ms",  "N",      "how long smaller requests may be admitted past one\n"
                                         "--admit-kv-reserve holds; after that nothing passes it.\n"
                                         "0 (default) never" },
+    { "--admit-claimant",     nullptr,  "the frontmost big waiter held past --admit-backfill-ms is\n"
+                                        "asked before everything else, and no other admission may\n"
+                                        "move the wall time its pool room was committed to it\n"
+                                        "later (PLAN-admit-line-jump §6.8). Inert without\n"
+                                        "--admit-kv-reserve and --admit-backfill-ms" },
+    { "--admit-claimant-min-pct", "N",  "a held waiter is big enough to claim when its whole\n"
+                                        "commitment takes more than N% of the KV pool.\n"
+                                        "50 (default) = more than half; 0 = any held waiter" },
     { "--max-num-seqs",       "N",      "the largest number of sequences one step may carry" },
     { "--max-model-len",      "N",      "context bound; 0 takes the model's training context" },
     { "--rope-scaling",       "SPEC",   "yarn:FACTOR[:ORIG]: static YaRN over the container's own rotary\n"
@@ -771,6 +779,8 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--admit-kv-reserve"))      { if (!num(0, INT64_MAX, &c->admit_kv_reserve)) return RAD_E_INVAL; }
         else if (S("--admit-backfill-ms"))     { if (!num(0, INT64_MAX, &c->admit_backfill_ms)) return RAD_E_INVAL; }
+        else if (S("--admit-claimant"))        c->admit_claimant = true;
+        else if (S("--admit-claimant-min-pct")) { if (!num(0, 99, &c->admit_claimant_min_pct)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
         else if (S("--rope-scaling")) {
@@ -1820,6 +1830,8 @@ const ShowRow kShow[] = {
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--admit-backfill-ms",  [](const Config& c) {
           return c.admit_backfill_ms > 0 ? num(c.admit_backfill_ms) : std::string("off"); } },
+    { "--admit-claimant",     [](const Config& c) { return onoff(c.admit_claimant); } },
+    { "--admit-claimant-min-pct", [](const Config& c) { return num(c.admit_claimant_min_pct); } },
     { "--admit-kv-reserve",   [](const Config& c) {
           return c.admit_kv_reserve > 0 ? num(c.admit_kv_reserve) : std::string("off"); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },

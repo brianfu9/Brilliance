@@ -506,9 +506,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         }
         o["requests"] = std::move(reqs);
         /* What admission decides with, so a client can redraw it: the reserve each request
-         * carries, and how long a held one lets others pass. */
+         * carries, how long a held one lets others pass, and whether the claimant policy is on. */
         o["queue"] = { { "kv_reserve",  m.admit_kv_reserve },
-                       { "backfill_ms", m.admit_backfill_ms } };
+                       { "backfill_ms", m.admit_backfill_ms },
+                       { "claimant",    m.admit_claimant },
+                       { "claimant_min_pct", m.admit_claimant_min_pct } };
     }
 
     /* The engine's snapshot. Absent without a snapshot function, and the page then omits those

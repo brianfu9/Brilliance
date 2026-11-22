@@ -328,8 +328,14 @@ struct FakeKV : IKVManager {
         }
         return n;
     }
+    /* How many of the unbacked elastic blocks the fleet can currently give back (-1 = all). */
+    int64_t flex_room_blocks = -1;
     int64_t available_blocks(int32_t g) const override {
-        return g >= 0 && g < (int32_t)freelist.size() ? (int64_t)freelist[(size_t)g].size() : 0;
+        if (g < 0 || g >= (int32_t)freelist.size()) return 0;
+        const int64_t fb = free_blocks(g);
+        const int64_t lent = (int64_t)freelist[(size_t)g].size() - fb;
+        const int64_t recallable = flex_room_blocks < 0 ? lent : std::min(lent, flex_room_blocks);
+        return fb + (recallable > 0 ? recallable : 0);
     }
 
     const std::vector<int32_t>& block_table(uint64_t id, int32_t g) const override {

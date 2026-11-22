@@ -918,6 +918,18 @@ struct Config {
     /* --admit-backfill-ms: how long requests behind one --admit-kv-reserve holds may be admitted
      * past it when they fit. After that nothing passes it until it is admitted. 0 = never. */
     int64_t admit_backfill_ms = 0;
+    /* --admit-claimant: the claimant policy (PLAN-admit-line-jump §6.8, "lindsay"). The frontmost
+     * big waiter held past --admit-backfill-ms is asked before everything else, ungated; every
+     * other admission must not move the wall time its pool room was committed to it (its anchor,
+     * stamped at first claim) later. Needs --admit-kv-reserve and --admit-backfill-ms: without
+     * holds there is no window clock and no claimant. Off by default. */
+    bool admit_claimant = false;
+    /* --admit-claimant-min-pct: how big a held waiter must be to become a claimant — its whole
+     * commitment must take more than this percent of the binding pool. 50 (default) is the
+     * model's 2w > T; 0 lets any waiter held past the window claim. The Lean bound
+     * (sbc_frontmost_bound) holds for any w <= T, so every value keeps the frontmost guarantee;
+     * a lower one replaces head-of-line blocking behind medium waiters with the anchor gate. */
+    int64_t admit_claimant_min_pct = 50;
     int64_t max_seqs = 256;
     int64_t max_ctx = 0;               /* 0 = the model's training context */
     /* --rope-scaling: "yarn:FACTOR[:ORIG]" writes YaRN over the checkpoint's own rotary keys (the

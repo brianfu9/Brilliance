@@ -143,6 +143,8 @@ private:
 
     Counter c_prompt_tokens_, c_generation_tokens_, c_preemptions_, c_preempt_forced_,
             c_admit_kv_held_;
+    /* --admit-claimant: claimants stamped and admitted, fillers refused by the anchor gate. */
+    Counter c_claimants_total_, c_claimant_admitted_, c_claimant_gate_blocked_;
     /* Engine steps. With speculation a step emits 1 + the accepted drafts, so tokens/s does not
      * give step time; two scrapes of this counter and a clock do. */
     Counter c_steps_;

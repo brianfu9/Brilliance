@@ -616,6 +616,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--preempt-wait-ms", { "5000" } },
         { "--admit-kv-reserve", { "16384" } },
         { "--admit-backfill-ms", { "60000" } },
+        { "--admit-claimant-min-pct", { "25" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },
         { "--gpu-memory-mib", { "16384" } }, { "--gpu-headroom-mib", { "128" } },

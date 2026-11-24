@@ -151,7 +151,7 @@ if (Test-Path $vswhere) {
   $vsPath = (& $vswhere -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
   if ($vsPath) {
     $msvc = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "$MsvcToolset.*" } | Sort-Object Name -Descending | Select-Object -First 1
+            Where-Object { $_.Name -like "$MsvcToolset.*" -or $_.Name -like "14.5*" } | Sort-Object Name -Descending | Select-Object -First 1
     $vs = [pscustomobject]@{
       Path   = $vsPath
       Msvc   = $(if ($msvc) { $msvc.Name } else { $null })

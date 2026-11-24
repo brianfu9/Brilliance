@@ -4352,14 +4352,18 @@ SchedMetrics Scheduler::metrics_locked() const {
     m.n_kv_groups = (int)gs.size();
     if (m.n_kv_groups > RAD_SCHED_MAX_KV_GROUPS) m.n_kv_groups = RAD_SCHED_MAX_KV_GROUPS;
     for (int i = 0; i < m.n_kv_groups; ++i) {
-        /* Against the carve and what is held of it, not the live mark. An elastic pool grows
-         * back on demand, so a released block is neither occupied nor unavailable; counting it
-         * would make an idle server read nearly full and turn the pool's own arbitration into
-         * apparent workload pressure for anything watching kv_util. */
-        const int64_t tot = kv_->total_blocks(i);
-        const int64_t fr  = tot - kv_->held_blocks(i);
+        /* Report real elastic capacity (held + available, i.e. backed + recallable flex room)
+         * for lendable full-attention groups instead of the virtual VMem carve (which can be
+         * max_seqs * max_ctx = 1M+ tokens). Without flex, held + available equals total_blocks. */
+        const int64_t total = kv_->total_blocks(i);
+        const int64_t held  = kv_->held_blocks(i);
+        const int64_t tot   = (gs[(size_t)i].decl.kind == RAD_KV_FULL && kv_->block_tokens(i) > 0)
+            ? std::min(total, held + kv_->available_blocks(i))
+            : total;
+        const int64_t fr    = std::max<int64_t>(tot - held, 0);
         m.kv[i].name = gs[(size_t)i].name.c_str();
         m.kv[i].blocks_total = tot;
+        m.kv[i].blocks_carve = total;
         m.kv[i].blocks_free = fr;
         m.kv[i].utilisation = tot > 0 ? (float)(1.0 - (double)fr / (double)tot) : 0.0f;
         m.kv[i].block_tokens = kv_->block_tokens(i);

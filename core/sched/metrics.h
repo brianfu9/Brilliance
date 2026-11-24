@@ -82,6 +82,7 @@ struct SchedMetrics {
     struct Group {
         const char* name = "";
         int64_t blocks_total = 0;
+        int64_t blocks_carve = 0;
         int64_t blocks_free = 0;
         float   utilisation = 0.0f;   /* 1 - free/total */
         /* Tokens one block covers, 0 for a stateful group. */

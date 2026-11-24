@@ -85,7 +85,8 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         o.kv_bytes_used  += m.kv[i].bytes_used;
         o.kv_bytes_carved += m.kv[i].bytes_carved;
         if (m.kv[i].block_tokens <= 0 || m.kv[i].window) continue;
-        const int64_t t = m.kv[i].blocks_total * m.kv[i].block_tokens;
+        const int64_t cap = m.kv[i].blocks_carve > 0 ? m.kv[i].blocks_carve : m.kv[i].blocks_total;
+        const int64_t t = cap * m.kv[i].block_tokens;
         if (o.kv_tokens_max == 0 || t < o.kv_tokens_max) o.kv_tokens_max = t;
     }
 

@@ -191,6 +191,7 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s.value("queue_cap", (int64_t)0), (int64_t)32);
     CHECK_EQ(s.value("in_flight", (int64_t)-1), (int64_t)0);
     CHECK_EQ(s.value("running", (int64_t)0), (int64_t)1);
+    CHECK_EQ(s.value("kv_tokens_total", (int64_t)0), (int64_t)4000);
     CHECK_EQ(s.value("kv_tokens_cached", (int64_t)0), (int64_t)300);
     CHECK_EQ(s.value("kv_tokens_max", (int64_t)0), (int64_t)6000);
     REQUIRE(s["draft_positions"].size() == 2);
@@ -449,6 +450,14 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(p.kv_tokens_total, (int64_t)(200 * 16));
     CHECK_EQ(p.kv_tokens_used, (int64_t)(190 * 16));
     CHECK_EQ(p.kv_tokens_max, (int64_t)(100 * 16));
+
+    /* Elastic KV: blocks_carve carries the virtual carve while blocks_total reports real
+     * elastic capacity, so kv_tokens_max tracks the carve without distorting kv_tokens_total. */
+    m.kv[0].blocks_carve = 500;
+    m.kv[1].blocks_carve = 400;
+    const server::SchedMetrics e = bridge_metrics(m);
+    CHECK_EQ(e.kv_tokens_total, (int64_t)(200 * 16));
+    CHECK_EQ(e.kv_tokens_max, (int64_t)(400 * 16));
 }
 
 RAD_TEST_MAIN()

@@ -1,14 +1,16 @@
 // The fleet: what is on each card, what every model is doing, and how that moved over the window.
-import { useMemo } from "react"
+import { useCallback, useEffect, useMemo } from "react"
 import { ModelSwitch } from "@/components/model-switch"
 import { Chart, Legend, type Line } from "@/components/chart"
 import { Empty, Kpi, Panel, PartBar, PartLegend, StateBadge, StateDot, STATE_OF_CODE, stateOf, type Part } from "@/components/bits"
+import { FleetActivity } from "@/components/activity/FleetActivity"
+import { QueuePanel } from "@/components/activity/QueuePanel"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import type { Fleet, FleetModel } from "@/lib/api"
 import { bytesParts, fBytes, fClock, fDur, fin, fNum } from "@/lib/format"
-import { fleet as fleetScope, useScope, type Series } from "@/lib/store"
-import { hrefOf, useRange } from "@/lib/ui"
+import { fleet as fleetScope, useFleetRequestLog, useScope, type Series } from "@/lib/store"
+import { hrefOf, overviewHref, useRange, useRoute } from "@/lib/ui"
 import { RangeToggle } from "@/components/range"
 
 const hue = (i: number) => `var(--series-${(i % 8) + 1})`
@@ -25,12 +27,31 @@ const held = (m: FleetModel) =>
 export function Overview() {
   const scope = useScope(fleetScope)
   const range = useRange()
+  const route = useRoute()
+
+  // Ref-counted opt-in: send `?activity=1&after_n=...` ONLY while Overview is mounted.
+  useEffect(() => {
+    fleetScope.acquireActivity()
+    return () => { fleetScope.releaseActivity() }
+  }, [])
+
+  const log = useFleetRequestLog(scope)
+
   const live = scope.live
-  if (!live) return <Empty className="m-6">{scope.error ?? "Waiting for data…"}</Empty>
   // A served adapter is listed as a child of its model, with the model's state and counters: the
   // overview counts and draws the models themselves.
-  const f = { ...live, models: live.models.filter((m) => m.adapter !== true) }
-  const hueOf = new Map(f.models.map((m, i) => [m.id, hue(i)]))
+  const nonAdapterModels = live ? live.models.filter((m) => m.adapter !== true) : []
+  const modelKey = nonAdapterModels.map((m) => `${m.id}:${(m.cards ?? []).join(",")}`).join("|")
+  // Stabilize models & hueOf across 5 Hz polls so memoized <FleetActivity> never re-renders on ticks.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const stableModels = useMemo(() => nonAdapterModels, [modelKey])
+  const hueOf = useMemo(() => new Map(stableModels.map((m, i) => [m.id, hue(i)])), [stableModels])
+  const onSelectModel = useCallback((m: string | null) => {
+    location.hash = overviewHref(m)
+  }, [])
+
+  if (!live) return <Empty className="m-6">{scope.error ?? "Waiting for data…"}</Empty>
+  const f = { ...live, models: nonAdapterModels }
   const resident = f.models.filter((m) => m.state === "resident")
   const parked = f.models.filter((m) => m.state === "parked")
   const cold = f.models.filter((m) => m.state === "cold")
@@ -69,19 +90,6 @@ export function Overview() {
         <Kpi label="Power draw" value={noPower ? "n/a" : power > 0 ? fNum(power) : "–"} unit={!noPower && power > 0 ? "W" : undefined}
           detail={noPower ? UNREPORTED : somePower < f.cards.length && somePower > 0 ? `across ${somePower} of ${f.cards.length} accelerators` : `across ${f.cards.length} accelerator${f.cards.length === 1 ? "" : "s"}`} />
       </div>
-
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-muted-foreground">Time range of the charts below</span>
-        <RangeToggle className="ml-auto" />
-      </div>
-
-      <div className="grid gap-3 xl:grid-cols-2">
-        {f.cards.map((c) => <CardPanel key={c.card} fleet={f} card={c.card} hueOf={hueOf} data={scope.series} version={scope.version} range={range} />)}
-      </div>
-
-      <Panel title="State over time" description="Each model's state across the time range">
-        <StateStrip models={f.models} data={scope.series} version={scope.version} range={range} />
-      </Panel>
 
       <Panel title="Models" flush>
         <Table>
@@ -125,6 +133,41 @@ export function Overview() {
           </TableBody>
         </Table>
       </Panel>
+
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Time range of the charts below</span>
+        <RangeToggle className="ml-auto" />
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-2">
+        {f.cards.map((c) => <CardPanel key={c.card} fleet={f} card={c.card} hueOf={hueOf} data={scope.series} version={scope.version} range={range} />)}
+      </div>
+
+      <Panel title="State over time" description="Each model's state across the time range">
+        <StateStrip models={f.models} data={scope.series} version={scope.version} range={range} />
+      </Panel>
+
+      <QueuePanel
+        models={f.models}
+        modelStats={scope.modelStats}
+        modelStatsReceivedAt={scope.modelStatsReceivedAt}
+        hueOf={hueOf}
+        storagePrefix="radiance-fleet"
+      />
+
+      <FleetActivity
+        records={log.records}
+        total={log.total}
+        hasMore={log.hasMore}
+        loadingMore={log.loadingMore}
+        onLoadOlder={log.loadOlder}
+        models={stableModels}
+        hueOf={hueOf}
+        selectedModel={route.filterModel}
+        onSelectModel={onSelectModel}
+        storagePrefix="radiance-fleet"
+        forbidden={log.forbidden}
+      />
     </div>
   )
 }

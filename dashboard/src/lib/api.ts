@@ -10,6 +10,8 @@ export interface HistoryBody<Live> {
   t: number[]
   c: Columns
   requests?: FinishedRequest[]
+  oldest_n?: number
+  model_stats?: Record<string, Stats>
   live: Live | null
 }
 
@@ -65,7 +67,7 @@ export interface Stats {
   jobs: { running: number; done: number; failed: number; total_ms: number; last_ms: number }
   running?: number; waiting?: number
   kv_bytes_used?: number; kv_bytes_total?: number
-  kv_tokens_used?: number; kv_tokens_total?: number; kv_tokens_cached?: number; now_ms: number
+  kv_tokens_used?: number; kv_tokens_total?: number; kv_tokens_max?: number; kv_tokens_cached?: number; now_ms: number
   queue?: { kv_reserve: number; backfill_ms: number }
   prefix_hit_rate?: number; prefill_tps?: number; decode_tps?: number
   total_requests?: number; preemptions?: number

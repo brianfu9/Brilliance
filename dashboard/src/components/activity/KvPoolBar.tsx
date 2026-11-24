@@ -30,6 +30,10 @@ export const KV_POOL_CSS = `
     --q-s2: #eb6834;
     --q-s3: #1baf7a;
     --q-s4: #eda100;
+    --q-s5: #8a56c7;
+    --q-s6: #0e9aa7;
+    --q-s7: #d65780;
+    --q-s8: #6b8e23;
     --q-cache: #b9b8b2;
     --q-warn: #c98500;
     --q-warn-ink: #8a5a00;
@@ -43,6 +47,10 @@ export const KV_POOL_CSS = `
     --q-s2: #d95926;
     --q-s3: #199e70;
     --q-s4: #c98500;
+    --q-s5: #a577de;
+    --q-s6: #26b5c2;
+    --q-s7: #e57599;
+    --q-s8: #8ab03c;
     --q-cache: #5f5e5a;
     --q-warn: #eda100;
     --q-warn-ink: #f2bd4d;
@@ -195,7 +203,7 @@ export function KvPoolBar({ snapshot, slots }: Props) {
                       {
                         left: `calc(${pct(g.start, l.total)}% + 1px)`,
                         width: `max(0px, calc(${w}% - 2px))`,
-                        "--c": `var(--q-s${g.request ? slotOf(g.request) + 1 : 1})`,
+                        "--c": `var(--q-s${g.request ? (slotOf(g.request) % 8) + 1 : 1})`,
                       } as CSSProperties
                     }
                     aria-label={segmentTitle(g)}

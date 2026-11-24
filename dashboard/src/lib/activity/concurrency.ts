@@ -122,6 +122,8 @@ export interface ConcurrencyPoint {
   systemSpeed: number;
   /** Active decode time in ms. */
   activeMs: number;
+  /** True when this request overlapped another model running on the same accelerator. */
+  coRun?: boolean;
 }
 
 export interface ConcurrencyData {
@@ -142,6 +144,8 @@ export interface ConcurrencyData {
   /** System rate at k = 1, the speedup baseline. 0 when nothing ran alone. */
   soloTps: number;
   maxK: number;
+  /** Wall-clock ms of this model's decode that overlapped another model's activity. */
+  coRunMs: number;
   /**
    * Per input sample, in input order: the system rate averaged over that
    * request's own decode. A solo request keeps its own rate; a request that
@@ -172,6 +176,7 @@ const EMPTY: ConcurrencyData = {
   meanConcurrency: 0,
   soloTps: 0,
   maxK: 0,
+  coRunMs: 0,
   systemSpeeds: [],
   soloSpeeds: [],
   timed: 0,
@@ -254,7 +259,7 @@ function acceptBin(accept: number): number {
 function fitSoloModel(points: ConcurrencyPoint[]): {
   predict: (p: ConcurrencyPoint) => number;
 } | null {
-  const solo = points.filter((p) => p.meanK <= 1);
+  const solo = points.filter((p) => p.meanK <= 1 && !p.coRun);
   if (solo.length < MIN_SOLO_MODEL) return null;
   const cell = new Map<string, number[]>();
   const row = new Map<number, number[]>();
@@ -303,9 +308,14 @@ interface Span {
   context: number;
   /** Draft acceptance rate 0..1; -1 when the sample carried no draft data. */
   accept: number;
+  /** Accumulated ms overlapping another model on the same card. */
+  coRunMs: number;
 }
 
-export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
+export function buildConcurrency(
+  samples: DecodeSample[],
+  otherIntervals?: readonly { start: number; end: number }[],
+): ConcurrencyData {
   const spans: Span[] = [];
   let untimed = 0;
   const systemSpeeds = new Array<number>(samples.length).fill(NaN);
@@ -335,6 +345,7 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
       session: s.session ?? "",
       context: s.context ?? 0,
       accept: s.accept ?? -1,
+      coRunMs: 0,
     });
   }
   if (spans.length === 0) return { ...EMPTY, systemSpeeds, soloSpeeds, untimed };
@@ -342,24 +353,36 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
   // Sweep the start/end edges. Every edge at one instant is applied before
   // the next segment opens, so a decode ending exactly when another starts
   // does not count as an overlap.
-  type Edge = { t: number; span: number; open: boolean };
+  type Edge = { t: number; span: number; open: boolean; other?: boolean };
   const edges: Edge[] = [];
   spans.forEach((sp, i) => {
     edges.push({ t: sp.start, span: i, open: true });
     edges.push({ t: sp.end, span: i, open: false });
   });
+  if (otherIntervals?.length) {
+    for (const iv of otherIntervals) {
+      if (!Number.isFinite(iv.start) || !Number.isFinite(iv.end) || iv.end <= iv.start) continue;
+      edges.push({ t: iv.start, span: -1, open: true, other: true });
+      edges.push({ t: iv.end, span: -1, open: false, other: true });
+    }
+  }
   edges.sort((a, b) => a.t - b.t);
 
   const active = new Set<number>();
+  let otherActive = 0;
+  let coRunMs = 0;
   const segments: DecodeSegment[] = [];
   const busy = new Map<number, { ms: number; tokens: number }>();
   let unionMs = 0;
+  let maxK = 0;
   let i = 0;
   while (i < edges.length) {
     const t = edges[i].t;
     while (i < edges.length && edges[i].t === t) {
-      if (edges[i].open) active.add(edges[i].span);
-      else active.delete(edges[i].span);
+      const e = edges[i];
+      if (e.other) otherActive += e.open ? 1 : -1;
+      else if (e.open) active.add(e.span);
+      else active.delete(e.span);
       i++;
     }
     if (i >= edges.length || active.size === 0) continue;
@@ -367,17 +390,25 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
     const dur = next - t;
     if (dur <= 0) continue;
     const k = active.size;
+    if (k > maxK) maxK = k;
+    const isCoRun = otherActive > 0;
     let rate = 0;
     for (const idx of active) rate += spans[idx].rate;
     for (const idx of active) {
       spans[idx].kMs += k * dur;
       spans[idx].sysTokens += rate * dur;
+      if (isCoRun) spans[idx].coRunMs += dur;
     }
+    if (isCoRun) coRunMs += dur;
     segments.push({ start: t, end: next, k, systemTps: rate * 1000 });
-    const level = busy.get(k) ?? { ms: 0, tokens: 0 };
-    level.ms += dur;
-    level.tokens += rate * dur;
-    busy.set(k, level);
+    // Exclude cross-model co-run segments from the k=1 solo baseline so
+    // GPU contention from another model does not deflate soloTps.
+    if (!(k === 1 && isCoRun)) {
+      const level = busy.get(k) ?? { ms: 0, tokens: 0 };
+      level.ms += dur;
+      level.tokens += rate * dur;
+      busy.set(k, level);
+    }
     unionMs += dur;
   }
 
@@ -403,13 +434,12 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
       accept: sp.accept,
       systemSpeed: sysSpeed,
       activeMs: dur,
+      coRun: sp.coRunMs > 0,
     };
   });
 
   const solo = busy.get(1);
   const soloTps = solo && solo.ms > 0 ? (solo.tokens / solo.ms) * 1000 : 0;
-  let maxK = 0;
-  for (const k of busy.keys()) if (k > maxK) maxK = k;
 
   const speedsByK = new Map<number, number[]>();
   for (const p of points) {
@@ -449,7 +479,7 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
   const model = fitSoloModel(points);
   points.forEach((p, i) => {
     let solo: number;
-    if (p.meanK <= 1) {
+    if (p.meanK <= 1 && !p.coRun) {
       solo = p.speed;
     } else if (model) {
       const pred = model.predict(p);
@@ -474,6 +504,7 @@ export function buildConcurrency(samples: DecodeSample[]): ConcurrencyData {
     meanConcurrency: unionMs > 0 ? sumMs / unionMs : 0,
     soloTps,
     maxK,
+    coRunMs,
     systemSpeeds,
     soloSpeeds,
     timed: spans.length,

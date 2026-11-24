@@ -249,6 +249,14 @@ describe("activityCellText", () => {
     expect(activityCellText(row, "capture")).toBe("");
     expect(activityCellText(row, "nope")).toBe("");
   });
+
+  it("renders dashes for token and timing cells on non-token kinds", () => {
+    const img = entry({ kind: "image", duration_ms: 1260 });
+    for (const col of ["cached", "prompt", "generated", "drafted", "prompt_speed", "gen_speed", "prompt_duration", "gen_duration"]) {
+      expect(activityCellText(img, col)).toBe("-");
+    }
+    expect(activityCellText(img, "duration")).toBe("1.26s");
+  });
 });
 
 describe("toMarkdownTable", () => {

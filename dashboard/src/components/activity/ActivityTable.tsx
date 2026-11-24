@@ -62,6 +62,7 @@ interface Props {
   storagePrefix: string;
   title?: string;
   emptyMessage?: string;
+  hueOf?: Map<string, string>;
 }
 
 /**
@@ -75,6 +76,7 @@ export function ActivityTable({
   storagePrefix,
   title,
   emptyMessage = "No activity recorded",
+  hueOf,
 }: Props) {
   const columnMeta = useMemo<ColumnMeta[]>(
     () => [
@@ -128,7 +130,9 @@ export function ActivityTable({
   // base order is what shows until a header is clicked to sort. The ID range
   // filter is applied client-side before the table sees the rows.
   const rows = useMemo(() => {
-    const sorted = [...metrics].sort((a, b) => b.id - a.id);
+    const sorted = [...metrics].sort(
+      (a, b) => (Date.parse(b.timestamp) - Date.parse(a.timestamp)) || (b.id - a.id),
+    );
     const minID = parseIDFilter(filters.minID);
     const maxID = parseIDFilter(filters.maxID);
     if (minID === null && maxID === null) return sorted;
@@ -162,12 +166,24 @@ export function ActivityTable({
         id: "model",
         accessorKey: "model",
         header: "Model",
-        cell: ({ row }) =>
-          row.original.model ? (
-            row.original.model
-          ) : (
-            <span className="text-muted-foreground">-</span>
-          ),
+        cell: ({ row }) => {
+          const requested = row.original.model;
+          const canonical = row.original.fleetModel ?? requested;
+          if (!requested) return <span className="text-muted-foreground">-</span>;
+          const aliased = Boolean(canonical && canonical !== requested);
+          const dotColor = hueOf ? (hueOf.get(canonical) ?? "var(--muted-foreground)") : undefined;
+          return (
+            <span
+              className="inline-flex items-center gap-1.5"
+              title={aliased ? `canonical: ${canonical}` : undefined}
+            >
+              {dotColor && (
+                <i className="size-2 shrink-0 rounded-full" style={{ background: dotColor }} />
+              )}
+              <span>{requested}</span>
+            </span>
+          );
+        },
       },
       {
         id: "req_path",
@@ -195,54 +211,66 @@ export function ActivityTable({
         accessorFn: (row) => row.tokens.cache_tokens,
         header: () => <HeaderLabel label="Cached" tooltip="prompt tokens from cache" />,
         cell: ({ row }) =>
-          row.original.tokens.cache_tokens > 0
-            ? row.original.tokens.cache_tokens.toLocaleString()
-            : "-",
+          isNonToken(row.original)
+            ? "-"
+            : row.original.tokens.cache_tokens > 0
+              ? row.original.tokens.cache_tokens.toLocaleString()
+              : "-",
       },
       {
         id: "prompt",
         accessorFn: (row) => row.tokens.input_tokens,
         header: () => <HeaderLabel label="Prompt" tooltip="new prompt tokens processed" />,
-        cell: ({ row }) => row.original.tokens.input_tokens.toLocaleString(),
+        cell: ({ row }) =>
+          isNonToken(row.original) ? "-" : row.original.tokens.input_tokens.toLocaleString(),
       },
       {
         id: "generated",
         accessorFn: (row) => row.tokens.output_tokens,
         header: "Generated",
-        cell: ({ row }) => row.original.tokens.output_tokens.toLocaleString(),
+        cell: ({ row }) =>
+          isNonToken(row.original) ? "-" : row.original.tokens.output_tokens.toLocaleString(),
       },
       {
         id: "drafted",
         accessorFn: (row) => row.tokens.draft_tokens,
         header: () => <HeaderLabel label="Drafted" tooltip="acceptance rate (accepted/drafted)" />,
         cell: ({ row }) =>
-          formatDrafted(row.original.tokens.draft_tokens, row.original.tokens.draft_acc_tokens),
+          isNonToken(row.original)
+            ? "-"
+            : formatDrafted(row.original.tokens.draft_tokens, row.original.tokens.draft_acc_tokens),
       },
       {
         id: "prompt_speed",
         accessorFn: (row) => row.tokens.prompt_per_second,
         header: "Prefill",
         cell: ({ row }) =>
-          isAborted(row.original) ? "-" : formatSpeed(row.original.tokens.prompt_per_second),
+          isNonToken(row.original) || isAborted(row.original)
+            ? "-"
+            : formatSpeed(row.original.tokens.prompt_per_second),
       },
       {
         id: "gen_speed",
         accessorFn: (row) => row.tokens.tokens_per_second,
         header: "Decode",
         cell: ({ row }) =>
-          isAborted(row.original) ? "-" : formatSpeed(row.original.tokens.tokens_per_second),
+          isNonToken(row.original) || isAborted(row.original)
+            ? "-"
+            : formatSpeed(row.original.tokens.tokens_per_second),
       },
       {
         id: "prompt_duration",
         accessorFn: (row) => row.tokens.prompt_ms,
         header: "Prefill Time",
-        cell: ({ row }) => formatOptionalDuration(row.original.tokens.prompt_ms),
+        cell: ({ row }) =>
+          isNonToken(row.original) ? "-" : formatOptionalDuration(row.original.tokens.prompt_ms),
       },
       {
         id: "gen_duration",
         accessorFn: (row) => row.tokens.predicted_ms,
         header: "Decode Time",
-        cell: ({ row }) => formatOptionalDuration(row.original.tokens.predicted_ms),
+        cell: ({ row }) =>
+          isNonToken(row.original) ? "-" : formatOptionalDuration(row.original.tokens.predicted_ms),
       },
       {
         id: "duration",
@@ -263,7 +291,7 @@ export function ActivityTable({
         cell: ({ row }) => <MetaCell metadata={row.original.metadata} />,
       },
     ],
-    [],
+    [hueOf],
   );
 
   const table = useReactTable({
@@ -400,7 +428,7 @@ export function ActivityTable({
 
   return (
     <>
-      <Card className="mt-3 shrink-0 gap-0 overflow-hidden py-0">
+      <Card className="shrink-0 gap-0 overflow-hidden py-0">
         <CardHeader className="flex items-center justify-between border-b px-4 py-2">
           <div className="flex items-center gap-2">
             {title && (
@@ -638,6 +666,10 @@ const TD_CLASS = "px-3 py-4";
  */
 function isAborted(row: ActivityLogEntry): boolean {
   return row.error_msg?.startsWith("client disconnected") ?? false;
+}
+
+function isNonToken(row: ActivityLogEntry): boolean {
+  return !!row.kind && row.kind !== "chat" && row.kind !== "asr";
 }
 
 // Mirrors toPositiveInt in activityFilters.ts: keeps out blank, non-numeric

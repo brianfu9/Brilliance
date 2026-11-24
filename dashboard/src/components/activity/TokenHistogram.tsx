@@ -57,6 +57,8 @@ export function TokenHistogram({
   }
 
   const selStart = selectedBin !== null ? data.min + selectedBin * data.binSize : 0;
+  const shortUnit = unit === "tokens/sec" ? "tps" : unit;
+  const tickDecimals = range < 5 ? 1 : 0;
 
   return (
     <div className="mt-2 w-full">
@@ -219,7 +221,7 @@ export function TokenHistogram({
                 opacity={0.8}
                 textAnchor={fraction === 0 ? "start" : fraction >= 1 ? "end" : "middle"}
               >
-                {(data.min + fraction * range).toFixed(0)}
+                {(data.min + fraction * range).toFixed(tickDecimals)}
               </text>
             </g>
           );
@@ -251,15 +253,15 @@ export function TokenHistogram({
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pt-1 text-sm text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
           <span className="w-5 border-t-2 border-dashed border-blue-700 dark:border-blue-300"></span>
-          p50 ({data.p50.toFixed(1)} tps)
+          p50 ({data.p50.toFixed(1)} {shortUnit})
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="w-5 border-t-2 border-dashed border-orange-500 dark:border-orange-400"></span>
-          p10 ({data.p10.toFixed(1)} tps)
+          p10 ({data.p10.toFixed(1)} {shortUnit})
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="w-5 border-t-2 border-dashed border-red-500 dark:border-red-400"></span>
-          p1 ({data.p1.toFixed(1)} tps)
+          p1 ({data.p1.toFixed(1)} {shortUnit})
         </span>
         {selectedBin !== null && (
           <>

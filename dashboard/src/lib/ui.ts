@@ -30,16 +30,25 @@ export function setRange(s: number) { write("radiance.range", String(s)); range.
 export const useRange = () => useSyncExternalStore(range.subscribe, range.get)
 
 export type Tab = "performance" | "requests" | "sessions" | "details" | "sandbox"
-export interface Route { model: string | null; tab: Tab }
+export interface Route { model: string | null; tab: Tab; filterModel: string | null }
 const TABS: Tab[] = ["performance", "requests", "sessions", "details", "sandbox"]
 function parse(): Route {
   const m = /^#\/m\/([^/]+)(?:\/([a-z]+))?/.exec(location.hash)
-  if (!m) return { model: null, tab: "performance" }
+  if (!m) {
+    const q = location.hash.indexOf("?")
+    let filterModel: string | null = null
+    if (q >= 0) {
+      const raw = new URLSearchParams(location.hash.slice(q + 1)).get("model")
+      if (raw) filterModel = raw
+    }
+    return { model: null, tab: "performance", filterModel }
+  }
   const tab = TABS.includes(m[2] as Tab) ? (m[2] as Tab) : "performance"
-  return { model: decodeURIComponent(m[1]), tab }
+  return { model: decodeURIComponent(m[1]), tab, filterModel: null }
 }
 let current = parse()
 const routeSubs = new Set<() => void>()
 window.addEventListener("hashchange", () => { current = parse(); routeSubs.forEach((f) => f()) })
 export const useRoute = () => useSyncExternalStore((f) => { routeSubs.add(f); return () => { routeSubs.delete(f) } }, () => current)
 export const hrefOf = (model: string | null, tab: Tab = "performance") => (model === null ? "#/" : "#/m/" + encodeURIComponent(model) + "/" + tab)
+export const overviewHref = (model?: string | null) => (model ? "#/?model=" + encodeURIComponent(model) : "#/")

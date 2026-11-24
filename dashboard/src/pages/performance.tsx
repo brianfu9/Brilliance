@@ -9,8 +9,9 @@ import type { Scope, Series } from "@/lib/store"
 import { useRange } from "@/lib/ui"
 import { RangeToggle } from "@/components/range"
 import { cn } from "@/lib/utils"
+import type { Kind } from "@/lib/model-kind"
 
-export type Kind = "chat" | "embed" | "gen"
+export type { Kind }
 const fMs = (v: number) => (v >= 100 ? v.toFixed(0) : v.toFixed(2)) + " ms"
 const fPc = (v: number) => fPct(v, v >= 0.9995 ? 0 : 1) + "%"
 const fTps = (v: number) => (v === 0 ? "0" : fSig(v))

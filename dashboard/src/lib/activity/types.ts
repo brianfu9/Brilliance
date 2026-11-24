@@ -79,11 +79,16 @@ export interface TokenMetrics {
   preempted_ms?: number;
 }
 
+export type RequestKind = "chat" | "asr" | "image" | "video" | "tts" | "shape";
+
 export interface ActivityLogEntry {
   id: number;
   timestamp: string;
   src: string;
   model: string;
+  fleetModel?: string;
+  kind?: RequestKind;
+  audio_s?: number;
   req_path: string;
   resp_content_type: string;
   resp_status_code: number;
@@ -179,6 +184,8 @@ export interface QueueSnapshot {
   model: string;
   at_ms: number;
   kv_tokens_total: number;
+  kv_tokens_max?: number;
+  max_num_seqs?: number;
   kv_tokens_used: number;
   kv_tokens_cached: number;
   running: number;
@@ -291,6 +298,15 @@ export interface ActivityStatsData {
   gen_histogram: HistogramData | null;
   prompt_scatter: PromptScatterPoint[];
   gen_scatter: GenScatterPoint[];
+  duration_histogram?: HistogramData | null;
+  rtf_histogram?: HistogramData | null;
+  failed_requests?: number;
+  aborted_requests?: number;
+  median_duration_ms?: number;
+  mean_duration_ms?: number;
+  total_duration_ms?: number;
+  total_audio_s?: number;
+  median_rtf?: number;
   /** Every model with recorded activity, most recent first; unaffected by the model filter. */
   models?: ModelActivityCount[];
 }

@@ -16,8 +16,9 @@ export function SessionsView({ model }: { model: string }) {
   // The KV pool these conversations' cache lives in, drawn as the queue view draws it (from the
   // model's live /stats, five times a second), so the cached part is seen beside what is running.
   const scope = useScope(modelScope(model))
-  const snap = snapshotOf(model, scope.live, Date.now())
-  const assigner = useMemo(() => new SlotAssigner(4), [])
+  const snap = snapshotOf(model, scope.live, scope.liveReceivedAt)
+  const maxSeqs = scope.live?.max_num_seqs ?? 4
+  const assigner = useMemo(() => new SlotAssigner(maxSeqs), [maxSeqs])
   const slots = snap ? assigner.assign(runningRequests(snap).map((r) => requestKey(snap.model, r))) : new Map<string, number>()
   if (!s) return <Empty>{error ?? "Loading"}</Empty>
   const list = (s.sessions ?? []).slice().sort((a, b) => a.idle_s - b.idle_s)

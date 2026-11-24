@@ -251,4 +251,40 @@ describe("buildConcurrency", () => {
     const x = data.points.find((p) => p.speed === 100 && p.accept === 0.8)!;
     expect(x.soloEquiv).toBeCloseTo(100 * (8 / 6), 6);
   });
+
+  it("excludes cross-model overlapping segments from soloTps and fitSoloModel", () => {
+    // 1) soloTps exclusion: request A runs alone 0..2000 at 100 tok/s;
+    //    request B runs 4000..6000 at 30 tok/s while another model runs 4000..6000.
+    const simple = buildConcurrency(
+      [decode(2000, 2000, 200), decode(6000, 2000, 60)],
+      [{ start: 4000, end: 6000 }],
+    );
+    expect(simple.coRunMs).toBe(2000);
+    // B was excluded from busy.get(1), so soloTps stays 100 tok/s (not 65).
+    expect(simple.soloTps).toBeCloseTo(100, 6);
+    expect(simple.points[0].coRun).toBe(false);
+    expect(simple.points[1].coRun).toBe(true);
+
+    // 2) fitSoloModel exclusion: 50 clean solo requests at 100 tok/s + 50 co-run
+    //    k=1 requests at 30 tok/s + 2 overlapping k=2 requests at 40 tok/s.
+    const samples: DecodeSample[] = [];
+    const otherIntervals: { start: number; end: number }[] = [];
+    for (let i = 0; i < 50; i++) {
+      const t = 1_000_000 + i * 5000;
+      samples.push({ endMs: t + 1000, decodeMs: 1000, output: 100, speed: 100, context: 50_000, accept: 0.5 });
+      samples.push({ endMs: t + 3000, decodeMs: 1000, output: 30, speed: 30, context: 50_000, accept: 0.5 });
+      otherIntervals.push({ start: t + 2000, end: t + 3000 });
+    }
+    samples.push({ endMs: 10_000, decodeMs: 10_000, output: 400, speed: 40, context: 50_000, accept: 0.5 });
+    samples.push({ endMs: 10_000, decodeMs: 10_000, output: 400, speed: 40, context: 50_000, accept: 0.5 });
+    const data = buildConcurrency(samples, otherIntervals);
+    expect(data.coRunMs).toBe(50_000);
+    expect(data.soloTps).toBeCloseTo(100, 6);
+    const k2 = data.points.find((p) => p.meanK > 1)!;
+    // If co-run points had entered fitSoloModel, the cell median would be ~65 instead of 100.
+    expect(k2.soloEquiv).toBeCloseTo(100, 6);
+    // Co-run k=1 point is also predicted up to the clean solo baseline (100).
+    const coRunPt = data.points.find((p) => p.coRun)!;
+    expect(coRunPt.soloEquiv).toBeCloseTo(100, 6);
+  });
 });

@@ -137,6 +137,10 @@ export function summarizeActivity(rows: ActivityLogEntry[]): ActivitySummary {
  * renderer shows. The time column is rendered as an absolute timestamp because
  * an exported "5m ago" is meaningless once pasted somewhere else.
  */
+function isNonToken(row: ActivityLogEntry): boolean {
+  return !!row.kind && row.kind !== "chat" && row.kind !== "asr";
+}
+
 export function activityCellText(row: ActivityLogEntry, columnId: string): string {
   switch (columnId) {
     case "id":
@@ -154,21 +158,27 @@ export function activityCellText(row: ActivityLogEntry, columnId: string): strin
     case "resp_content_type":
       return row.resp_content_type || "-";
     case "cached":
-      return row.tokens.cache_tokens > 0 ? row.tokens.cache_tokens.toLocaleString() : "-";
+      return isNonToken(row)
+        ? "-"
+        : row.tokens.cache_tokens > 0
+          ? row.tokens.cache_tokens.toLocaleString()
+          : "-";
     case "prompt":
-      return row.tokens.input_tokens.toLocaleString();
+      return isNonToken(row) ? "-" : row.tokens.input_tokens.toLocaleString();
     case "generated":
-      return row.tokens.output_tokens.toLocaleString();
+      return isNonToken(row) ? "-" : row.tokens.output_tokens.toLocaleString();
     case "drafted":
-      return formatDrafted(row.tokens.draft_tokens, row.tokens.draft_acc_tokens);
+      return isNonToken(row)
+        ? "-"
+        : formatDrafted(row.tokens.draft_tokens, row.tokens.draft_acc_tokens);
     case "prompt_speed":
-      return formatSpeed(row.tokens.prompt_per_second);
+      return isNonToken(row) ? "-" : formatSpeed(row.tokens.prompt_per_second);
     case "gen_speed":
-      return formatSpeed(row.tokens.tokens_per_second);
+      return isNonToken(row) ? "-" : formatSpeed(row.tokens.tokens_per_second);
     case "prompt_duration":
-      return formatOptionalDuration(row.tokens.prompt_ms);
+      return isNonToken(row) ? "-" : formatOptionalDuration(row.tokens.prompt_ms);
     case "gen_duration":
-      return formatOptionalDuration(row.tokens.predicted_ms);
+      return isNonToken(row) ? "-" : formatOptionalDuration(row.tokens.predicted_ms);
     case "duration":
       return formatDuration(row.duration_ms);
     case "meta": {

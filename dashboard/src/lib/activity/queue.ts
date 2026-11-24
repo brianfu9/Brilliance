@@ -15,7 +15,8 @@ export function snapshotOf(model: string, s: Stats | null, receivedAtMs: number)
     }))
   return {
     model, at_ms: s.now_ms, client_received_at_ms: receivedAtMs,
-    kv_tokens_total: s.kv_tokens_total ?? 0, kv_tokens_used: s.kv_tokens_used ?? 0, kv_tokens_cached: s.kv_tokens_cached ?? 0,
+    kv_tokens_total: s.kv_tokens_total ?? 0, kv_tokens_max: s.kv_tokens_max, max_num_seqs: s.max_num_seqs,
+    kv_tokens_used: s.kv_tokens_used ?? 0, kv_tokens_cached: s.kv_tokens_cached ?? 0,
     running: s.running ?? 0, waiting: s.waiting ?? 0, decode_tps: s.decode_tps ?? 0, prefill_tps: s.prefill_tps ?? 0,
     preemptions: s.preemptions ?? 0, queue: s.queue, requests,
   }

@@ -9,7 +9,12 @@ import {
   type ReactNode,
 } from "react";
 import { cn } from "cn";
+import type { FleetModel, Stats } from "@/lib/api";
+import { kindOf } from "@/lib/model-kind";
+import { hrefOf } from "@/lib/ui";
 import type { QueueRequest, QueueSnapshot } from "@/lib/activity/types";
+import { snapshotOf } from "@/lib/activity/queue";
+import { formatDuration } from "@/lib/activity/format";
 import {
   AgeRatchet,
   SlotAssigner,
@@ -25,6 +30,7 @@ import {
 } from "@/lib/activity/queueView";
 import { useColumns } from "@/lib/activity/columns";
 import { usePersistent } from "@/lib/activity/persist";
+import { StateBadge } from "@/components/bits";
 import { ChevronDown, Columns3, GripVertical, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -47,15 +53,10 @@ import {
 } from "@/components/ui/table";
 import { KV_POOL_CSS, KvPoolBar, usePrefersReducedMotion } from "./KvPoolBar";
 
-// Column sets for the panel's tables. All visible by default: the picker
-// only changes what a user has hidden or moved, per storagePrefix. (The
-// fork's session, client and cancel columns need its in-flight join, which
-// this server has no data for; its "Other in flight" table goes with them.)
 interface QueueColumn {
   id: string;
   label: string;
   defaultVisible: boolean;
-  /** Right-align the column (numeric values). */
   right?: boolean;
 }
 
@@ -83,8 +84,6 @@ function isRight(cols: QueueColumn[], colId: string): boolean {
   return cols.find((c) => c.id === colId)?.right ?? false;
 }
 
-// The panel's table-cell styles, over the pool's palette (the .qp scope sets
-// the variables the cells read).
 const QUEUE_PANEL_CSS = `${KV_POOL_CSS}
   .qp-need,
   .qp-countdown {
@@ -95,7 +94,6 @@ const QUEUE_PANEL_CSS = `${KV_POOL_CSS}
     background: var(--q-track);
     overflow: hidden;
   }
-  /* Need against the whole pool, with a tick where the gate's room ends. */
   .qp-need {
     width: 72px;
     overflow: visible;
@@ -152,15 +150,9 @@ function fmtS(s: number): string {
   return `${s.toFixed(s < 10 ? 1 : 0)}s`;
 }
 
-// One table's column drag-reorder: reorders the order live as the drag
-// crosses other items, so the menu's order always matches what the table
-// shows.
 function useColumnDrag(columnOrder: string[], setColumnOrder: (order: string[]) => void) {
   const [dragId, setDragId] = useState<string | null>(null);
 
-  // A hovered row only yields once the pointer passes its midpoint in the
-  // direction of travel. Without that hysteresis the swap fires as soon as
-  // the pointer touches the neighbour and the items oscillate.
   function crossedMidpoint(e: DragEvent<HTMLDivElement>, movingDown: boolean): boolean {
     const el = e.currentTarget;
     const parent = el.offsetParent as HTMLElement | null;
@@ -206,22 +198,47 @@ function useColumnDrag(columnOrder: string[], setColumnOrder: (order: string[]) 
   return { dragId, handleDragStart, handleDragOver, handleDrop, handleDragEnd };
 }
 
+type QueueItem =
+  | { type: "token"; id: string; model?: FleetModel; snapshot: QueueSnapshot; hue?: string }
+  | { type: "media"; id: string; model?: FleetModel; stats: Stats; hue?: string }
+  | { type: "status"; id: string; model: FleetModel; hue?: string };
+
 interface Props {
-  snapshot: QueueSnapshot | null;
+  /** Single-model mode: pre-built snapshot (token-scheduled). */
+  snapshot?: QueueSnapshot | null;
+  /** Single-model mode: optional FleetModel metadata (for media/loading/waiting views). */
+  model?: FleetModel;
+  /** Single-model mode: raw live Stats (for media jobs when snapshot is null). */
+  stats?: Stats | null;
+  /** Multi-model fleet mode: all non-adapter fleet models. */
+  models?: FleetModel[];
+  /** Multi-model fleet mode: per-model live Stats from `/history?activity=1`. */
+  modelStats?: Record<string, Stats>;
+  /** Multi-model fleet mode: performance.now() timestamp when each model's Stats was received. */
+  modelStatsReceivedAt?: Record<string, number>;
+  /** Optional model id -> CSS color map. */
+  hueOf?: Map<string, string>;
   storagePrefix: string;
 }
 
 /**
- * The request queue for one model: the KV pool (who holds it, and what the
- * gate sees as room), the running batch and the waiting line with the
- * reason each request waits. Ages tick every animation frame between the
- * once-a-second snapshots.
+ * Live request queue panel — supports both multi-model parallel Overview mode (`models` + `modelStats`)
+ * and single-model Requests tab mode (`snapshot` / `model` / `stats`). Uses a single shared
+ * `requestAnimationFrame` clock across all active model sections.
  */
-export function QueuePanel({ snapshot, storagePrefix }: Props) {
+export function QueuePanel({
+  snapshot = null,
+  model,
+  stats = null,
+  models,
+  modelStats,
+  modelStatsReceivedAt,
+  hueOf,
+  storagePrefix,
+}: Props) {
+  const isFleetMode = models !== undefined;
   const reducedMotion = usePrefersReducedMotion();
 
-  // One picker for the whole panel: one section per table. The prefix is
-  // fixed for the panel's life, so capturing it here is intentional.
   const runningCols = useColumns(`${storagePrefix}-queue-running`, RUNNING_COLS);
   const waitingCols = useColumns(`${storagePrefix}-queue-waiting`, WAITING_COLS);
   const runningDrag = useColumnDrag(runningCols.columnOrder, runningCols.setColumnOrder);
@@ -229,11 +246,74 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
 
   const [open, setOpen] = usePersistent<boolean>(`${storagePrefix}-queue-open`, true);
 
-  // Ages and hold times tick between the once-a-second snapshots. rAF, not a
-  // coarse interval: the displayed age must move every frame or the interval's
-  // quantum reads as stutter, and rAF pauses in a hidden tab for free.
+  const items = useMemo<QueueItem[]>(() => {
+    if (isFleetMode) {
+      const relevant = (models ?? []).filter(
+        (m) =>
+          m.adapter !== true &&
+          (m.state === "resident" ||
+            m.state === "loading" ||
+            m.state === "waiting" ||
+            (m.in_flight ?? 0) > 0 ||
+            (m.waiting ?? 0) > 0),
+      );
+      const rank = (m: FleetModel) => {
+        if ((m.in_flight ?? 0) > 0 || (m.waiting ?? 0) > 0) return 0;
+        if (m.state === "loading" || m.state === "waiting") return 1;
+        return 2;
+      };
+      const sorted = relevant.slice().sort((a, b) => rank(a) - rank(b));
+      const out: QueueItem[] = [];
+      for (const m of sorted) {
+        const hue = hueOf?.get(m.id);
+        const s = modelStats?.[m.id] ?? null;
+        const [kind] = kindOf(m.capabilities);
+        if ((kind === "chat" || kind === "embed") && s && s.kv_tokens_total !== undefined) {
+          const snap = snapshotOf(m.id, s, modelStatsReceivedAt?.[m.id] ?? 0);
+          if (snap) {
+            out.push({ type: "token", id: m.id, model: m, snapshot: snap, hue });
+            continue;
+          }
+        }
+        if (s && (kind === "gen" || s.kv_tokens_total === undefined)) {
+          out.push({ type: "media", id: m.id, model: m, stats: s, hue });
+          continue;
+        }
+        if (m.state === "loading" || m.state === "waiting" || (m.waiting ?? 0) > 0 || (m.in_flight ?? 0) > 0) {
+          out.push({ type: "status", id: m.id, model: m, hue });
+        }
+      }
+      return out;
+    }
+
+    // Single-model mode
+    const hue = model ? hueOf?.get(model.id) : undefined;
+    const [kind] = kindOf(model?.capabilities);
+    if (snapshot && (kind === "chat" || kind === "embed")) {
+      return [{ type: "token", id: snapshot.model, model, snapshot, hue }];
+    }
+    if (stats && (kind === "gen" || stats.kv_tokens_total === undefined)) {
+      return [{ type: "media", id: model?.id ?? stats.model, model, stats, hue }];
+    }
+    if (snapshot) {
+      return [{ type: "token", id: snapshot.model, model, snapshot, hue }];
+    }
+    if (model && (model.state === "loading" || model.state === "waiting" || (model.waiting ?? 0) > 0)) {
+      return [{ type: "status", id: model.id, model, hue }];
+    }
+    return [];
+  }, [isFleetMode, models, modelStats, modelStatsReceivedAt, hueOf, snapshot, model, stats]);
+
+  const tokenSnapshots = useMemo(
+    () => items.filter((it): it is Extract<QueueItem, { type: "token" }> => it.type === "token").map((it) => it.snapshot),
+    [items],
+  );
+  const hasTickingWork = tokenSnapshots.some((s) => s.requests.length > 0);
+
+  // Single shared requestAnimationFrame clock for all active model sections.
   const [nowMs, setNowMs] = useState(() => performance.now());
   useEffect(() => {
+    if (!open || !hasTickingWork) return;
     let raf = 0;
     const tick = () => {
       setNowMs(performance.now());
@@ -241,51 +321,19 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [open, hasTickingWork]);
 
-  // A row's engine age only increases, but a snapshot re-baseline can land
-  // behind where the row's tick has already counted (its stamp lags the
-  // browser's event processing by a variable delay), which reads as the
-  // timer running backwards. The ratchet holds each row at its highest shown
-  // value. Keys: model#id for a scheduler row's age, "h:" for its hold time.
   const ages = useMemo(() => new AgeRatchet(), []);
   useEffect(() => {
     const keys: string[] = [];
-    if (snapshot) {
-      for (const r of snapshot.requests) {
-        const k = requestKey(snapshot.model, r);
+    for (const s of tokenSnapshots) {
+      for (const r of s.requests) {
+        const k = requestKey(s.model, r);
         keys.push(k, `h:${k}`);
       }
     }
     ages.prune(keys);
-  }, [snapshot, ages]);
-
-  // Four slots: rad batches at most four sequences (--max-num-seqs 4).
-  const assigner = useMemo(() => new SlotAssigner(4), []);
-
-  const running = useMemo(() => (snapshot ? runningRequests(snapshot) : []), [snapshot]);
-  const waiting = useMemo(() => (snapshot ? waitingRequests(snapshot) : []), [snapshot]);
-
-  const slots = useMemo(
-    () =>
-      snapshot
-        ? assigner.assign(running.map((r) => requestKey(snapshot.model, r)))
-        : new Map<string, number>(),
-    [snapshot, assigner, running],
-  );
-
-  if (!snapshot) {
-    return <div className="text-muted-foreground text-sm">No queue data</div>;
-  }
-
-  // Non-null from here on. Closures (the cell renderers, the row maps)
-  // capture this const rather than the parameter, so they keep the narrowed
-  // type.
-  const snap = snapshot;
-
-  const l = kvLayout(snap);
-  const policy = snap.queue;
-  const dt = Math.max(0, (nowMs - (snap.client_received_at_ms ?? nowMs)) / 1000);
+  }, [tokenSnapshots, ages]);
 
   const runningVisible = runningCols.columnOrder.filter(
     (id) => runningCols.columnVisibility[id] !== false,
@@ -293,6 +341,247 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
   const waitingVisible = waitingCols.columnOrder.filter(
     (id) => waitingCols.columnVisibility[id] !== false,
   );
+
+  let totalRunning = 0;
+  let totalWaiting = 0;
+  for (const it of items) {
+    if (it.type === "token") {
+      totalRunning += runningRequests(it.snapshot).length;
+      totalWaiting += waitingRequests(it.snapshot).length;
+    } else if (it.type === "media") {
+      totalRunning += it.stats.jobs?.running ?? 0;
+      totalWaiting += it.model?.waiting ?? 0;
+    } else {
+      totalRunning += it.model.in_flight ?? 0;
+      totalWaiting += it.model.waiting ?? 0;
+    }
+  }
+
+  if (items.length === 0) {
+    if (!isFleetMode) {
+      return <div className="text-muted-foreground text-sm">No queue data</div>;
+    }
+    return (
+      <Card className="qp relative p-3">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+          <span className="text-muted-foreground text-xs uppercase tracking-wider">Request Queue</span>
+          <span className="text-xs text-muted-foreground">No models loaded</span>
+        </div>
+      </Card>
+    );
+  }
+
+  const hasTokenSection = tokenSnapshots.length > 0;
+  const multiSection = items.length > 1;
+
+  return (
+    <Card className="qp relative p-3">
+      <style>{QUEUE_PANEL_CSS}</style>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pr-16 text-sm">
+        <span className="text-muted-foreground text-xs uppercase tracking-wider">Request Queue</span>
+        <span>
+          <span className="font-semibold tabular-nums">{totalRunning}</span> running
+        </span>
+        <span>
+          <span className="font-semibold tabular-nums">{totalWaiting}</span> waiting
+        </span>
+        {isFleetMode && items.length > 1 && (
+          <span className="text-xs text-muted-foreground tabular-nums">
+            across {items.length} active models
+          </span>
+        )}
+      </div>
+      <div className="absolute right-2 top-2 flex items-center gap-1">
+        {hasTokenSection && (
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              className="text-muted-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded-full"
+              title="Select queue columns"
+            >
+              <Columns3 className="size-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-[18rem] max-h-[50vh] overflow-y-auto p-0">
+              <DropdownMenuLabel className="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
+                Columns{" "}
+                <span className="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
+              </DropdownMenuLabel>
+              <DropdownMenuGroup>
+                <div className="text-muted-foreground bg-muted/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider">
+                  Running
+                </div>
+                {runningCols.columnOrder.map((colId) => (
+                  <div
+                    key={colId}
+                    draggable="true"
+                    role="button"
+                    tabIndex={-1}
+                    aria-label={`Drag to reorder ${labelOf(RUNNING_COLS, colId)}`}
+                    onDragStart={(e) => runningDrag.handleDragStart(e, colId)}
+                    onDragOver={(e) => runningDrag.handleDragOver(e, colId)}
+                    onDrop={runningDrag.handleDrop}
+                    onDragEnd={runningDrag.handleDragEnd}
+                    className={runningDrag.dragId === colId ? "opacity-40" : ""}
+                  >
+                    <DropdownMenuCheckboxItem
+                      checked={runningCols.columnVisibility[colId] !== false}
+                      onCheckedChange={(visible) =>
+                        runningCols.setColumnVisibility({
+                          ...runningCols.columnVisibility,
+                          [colId]: visible,
+                        })
+                      }
+                    >
+                      <GripVertical className="text-muted-foreground/50 size-4 cursor-grab active:cursor-grabbing" />
+                      <span className="flex-1">{labelOf(RUNNING_COLS, colId)}</span>
+                    </DropdownMenuCheckboxItem>
+                  </div>
+                ))}
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <div className="text-muted-foreground bg-muted/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider">
+                  Waiting
+                </div>
+                {waitingCols.columnOrder.map((colId) => (
+                  <div
+                    key={colId}
+                    draggable="true"
+                    role="button"
+                    tabIndex={-1}
+                    aria-label={`Drag to reorder ${labelOf(WAITING_COLS, colId)}`}
+                    onDragStart={(e) => waitingDrag.handleDragStart(e, colId)}
+                    onDragOver={(e) => waitingDrag.handleDragOver(e, colId)}
+                    onDrop={waitingDrag.handleDrop}
+                    onDragEnd={waitingDrag.handleDragEnd}
+                    className={waitingDrag.dragId === colId ? "opacity-40" : ""}
+                  >
+                    <DropdownMenuCheckboxItem
+                      checked={waitingCols.columnVisibility[colId] !== false}
+                      onCheckedChange={(visible) =>
+                        waitingCols.setColumnVisibility({
+                          ...waitingCols.columnVisibility,
+                          [colId]: visible,
+                        })
+                      }
+                    >
+                      <GripVertical className="text-muted-foreground/50 size-4 cursor-grab active:cursor-grabbing" />
+                      <span className="flex-1">{labelOf(WAITING_COLS, colId)}</span>
+                    </DropdownMenuCheckboxItem>
+                  </div>
+                ))}
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="text-muted-foreground rounded-full"
+          onClick={() => setOpen(!open)}
+          title={open ? "Hide the request queue" : "Show the request queue"}
+        >
+          {open ? <X /> : <ChevronDown />}
+        </Button>
+      </div>
+
+      {open ? (
+        <div className="mt-3 flex flex-col gap-3">
+          {items.map((it) => {
+            if (it.type === "token") {
+              return (
+                <TokenQueueSection
+                  key={it.id}
+                  snap={it.snapshot}
+                  hue={it.hue}
+                  linkToModel={isFleetMode}
+                  collapseIdle={multiSection}
+                  nowMs={nowMs}
+                  ages={ages}
+                  reducedMotion={reducedMotion}
+                  runningVisible={runningVisible}
+                  waitingVisible={waitingVisible}
+                />
+              );
+            }
+            if (it.type === "media") {
+              return (
+                <MediaQueueSection
+                  key={it.id}
+                  id={it.id}
+                  model={it.model}
+                  stats={it.stats}
+                  hue={it.hue}
+                  linkToModel={isFleetMode}
+                />
+              );
+            }
+            return (
+              <StatusQueueSection
+                key={it.id}
+                model={it.model}
+                hue={it.hue}
+                linkToModel={isFleetMode}
+              />
+            );
+          })}
+        </div>
+      ) : null}
+    </Card>
+  );
+}
+
+function ModelTitle({ id, hue, linkToModel }: { id: string; hue?: string; linkToModel: boolean }) {
+  const content = (
+    <span className="inline-flex items-center gap-1.5 text-sm font-medium">
+      {hue && <i className="size-2 shrink-0 rounded-full" style={{ background: hue }} />}
+      {id}
+    </span>
+  );
+  if (!linkToModel) return content;
+  return (
+    <a href={hrefOf(id)} className="hover:underline">
+      {content}
+    </a>
+  );
+}
+
+function TokenQueueSection({
+  snap,
+  hue,
+  linkToModel,
+  collapseIdle,
+  nowMs,
+  ages,
+  reducedMotion,
+  runningVisible,
+  waitingVisible,
+}: {
+  snap: QueueSnapshot;
+  hue?: string;
+  linkToModel: boolean;
+  collapseIdle: boolean;
+  nowMs: number;
+  ages: AgeRatchet;
+  reducedMotion: boolean;
+  runningVisible: string[];
+  waitingVisible: string[];
+}) {
+  const maxSeqs = snap.max_num_seqs ?? 4;
+  const assigner = useMemo(() => new SlotAssigner(maxSeqs), [maxSeqs]);
+  const running = useMemo(() => runningRequests(snap), [snap]);
+  const waiting = useMemo(() => waitingRequests(snap), [snap]);
+  const slots = useMemo(
+    () => assigner.assign(running.map((r) => requestKey(snap.model, r))),
+    [snap.model, assigner, running],
+  );
+
+  const l = kvLayout(snap);
+  const policy = snap.queue;
+  const dt = snap.client_received_at_ms && snap.client_received_at_ms > 0
+    ? Math.max(0, (nowMs - snap.client_received_at_ms) / 1000)
+    : 0;
+  const hasElasticCarve =
+    typeof snap.kv_tokens_max === "number" && snap.kv_tokens_max > snap.kv_tokens_total;
 
   function slotOf(r: QueueRequest): number {
     return slots.get(requestKey(snap.model, r)) ?? 0;
@@ -308,7 +597,7 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
           <span className="inline-flex items-center gap-2">
             <span
               className="qp-key qp-held"
-              style={{ "--c": `var(--q-s${slotOf(r) + 1})` } as CSSProperties}
+              style={{ "--c": `var(--q-s${(slotOf(r) % 8) + 1})` } as CSSProperties}
             />
             <span className="font-mono">#{r.id}</span>
           </span>
@@ -328,7 +617,6 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
         );
       case "reserve":
         if (prefill && prefillLeft > 0 && reserveGap > 0) {
-          // The gap is the uncomputed prompt, not output room: say which is which.
           return (
             <span title="the prompt still to compute, plus the gate's output room">
               prefill {formatTokens(prefillLeft)} + out{" "}
@@ -416,235 +704,222 @@ export function QueuePanel({ snapshot, storagePrefix }: Props) {
     }
   }
 
+  const hideEmptyTable = collapseIdle && running.length === 0 && waiting.length === 0;
+
   return (
-    <Card className="qp relative p-3">
-      <style>{QUEUE_PANEL_CSS}</style>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pr-16 text-sm">
-        <span className="text-muted-foreground text-xs uppercase tracking-wider">Request Queue</span>
-        <span>
-          <span className="font-semibold tabular-nums">{running.length}</span> running
+    <section
+      className="border-t pt-3 first:border-t-0 first:pt-0"
+      aria-label={`Queue for ${snap.model}`}
+    >
+      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
+        <ModelTitle id={snap.model} hue={hue} linkToModel={linkToModel} />
+        <span className="tabular-nums">
+          KV <span className="font-semibold">{formatTokens(snap.kv_tokens_used)}</span> /{" "}
+          {formatTokens(snap.kv_tokens_total)}{" "}
+          <span className="text-muted-foreground">
+            ({pct(snap.kv_tokens_used, snap.kv_tokens_total).toFixed(0)}% held,{" "}
+            {formatTokens(l.cache)} of it cache)
+          </span>
         </span>
-        <span>
-          <span className="font-semibold tabular-nums">{waiting.length}</span> waiting
-        </span>
-      </div>
-      <div className="absolute right-2 top-2 flex items-center gap-1">
-        <DropdownMenu>
-          <DropdownMenuTrigger
-            className="text-muted-foreground hover:bg-muted inline-flex size-6 items-center justify-center rounded-full"
-            title="Select queue columns"
+        {hasElasticCarve && (
+          <span
+            className="rounded border px-1.5 py-px text-[11px] text-muted-foreground tabular-nums"
+            title="Virtual KV carve capacity; the bar and gate room use the live elastic capacity"
           >
-            <Columns3 className="size-4" />
-          </DropdownMenuTrigger>
-          {/* 50vh, not 60vh: with every column visible the list is ~540px tall,
-              which doesn't fit either above or below the header trigger on a
-              normal viewport -- floating-ui then keeps re-fitting and the menu
-              flickers between positions. 50vh leaves the menu a stable fit. */}
-          <DropdownMenuContent align="end" className="min-w-[18rem] max-h-[50vh] overflow-y-auto p-0">
-            <DropdownMenuLabel className="text-muted-foreground border-b px-3 py-2 text-xs font-medium uppercase tracking-wider">
-              Columns{" "}
-              <span className="text-[10px] normal-case tracking-normal">(drag to reorder)</span>
-            </DropdownMenuLabel>
-            <DropdownMenuGroup>
-              <div className="text-muted-foreground bg-muted/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider">
-                Running
-              </div>
-              {runningCols.columnOrder.map((colId) => (
-                <div
-                  key={colId}
-                  draggable="true"
-                  role="button"
-                  tabIndex={-1}
-                  aria-label={`Drag to reorder ${labelOf(RUNNING_COLS, colId)}`}
-                  onDragStart={(e) => runningDrag.handleDragStart(e, colId)}
-                  onDragOver={(e) => runningDrag.handleDragOver(e, colId)}
-                  onDrop={runningDrag.handleDrop}
-                  onDragEnd={runningDrag.handleDragEnd}
-                  className={runningDrag.dragId === colId ? "opacity-40" : ""}
-                >
-                  <DropdownMenuCheckboxItem
-                    checked={runningCols.columnVisibility[colId] !== false}
-                    onCheckedChange={(visible) =>
-                      runningCols.setColumnVisibility({
-                        ...runningCols.columnVisibility,
-                        [colId]: visible,
-                      })
-                    }
-                  >
-                    <GripVertical className="text-muted-foreground/50 size-4 cursor-grab active:cursor-grabbing" />
-                    <span className="flex-1">{labelOf(RUNNING_COLS, colId)}</span>
-                  </DropdownMenuCheckboxItem>
-                </div>
-              ))}
-            </DropdownMenuGroup>
-            <DropdownMenuSeparator />
-            <DropdownMenuGroup>
-              <div className="text-muted-foreground bg-muted/50 px-3 py-1.5 text-[10px] font-medium uppercase tracking-wider">
-                Waiting
-              </div>
-              {waitingCols.columnOrder.map((colId) => (
-                <div
-                  key={colId}
-                  draggable="true"
-                  role="button"
-                  tabIndex={-1}
-                  aria-label={`Drag to reorder ${labelOf(WAITING_COLS, colId)}`}
-                  onDragStart={(e) => waitingDrag.handleDragStart(e, colId)}
-                  onDragOver={(e) => waitingDrag.handleDragOver(e, colId)}
-                  onDrop={waitingDrag.handleDrop}
-                  onDragEnd={waitingDrag.handleDragEnd}
-                  className={waitingDrag.dragId === colId ? "opacity-40" : ""}
-                >
-                  <DropdownMenuCheckboxItem
-                    checked={waitingCols.columnVisibility[colId] !== false}
-                    onCheckedChange={(visible) =>
-                      waitingCols.setColumnVisibility({
-                        ...waitingCols.columnVisibility,
-                        [colId]: visible,
-                      })
-                    }
-                  >
-                    <GripVertical className="text-muted-foreground/50 size-4 cursor-grab active:cursor-grabbing" />
-                    <span className="flex-1">{labelOf(WAITING_COLS, colId)}</span>
-                  </DropdownMenuCheckboxItem>
-                </div>
-              ))}
-            </DropdownMenuGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          className="text-muted-foreground rounded-full"
-          onClick={() => setOpen(!open)}
-          title={open ? "Hide the request queue" : "Show the request queue"}
-        >
-          {open ? <X /> : <ChevronDown />}
-        </Button>
+            elastic · carve {formatTokens(snap.kv_tokens_max!)}
+          </span>
+        )}
+        <span className="tabular-nums">
+          gate room <span className="font-semibold">{formatTokens(l.room)}</span>
+        </span>
+        {snap.decode_tps > 0 && (
+          <span className="tabular-nums">{snap.decode_tps.toFixed(0)} tok/s decode</span>
+        )}
+        <span className="tabular-nums text-muted-foreground">
+          {snap.preemptions} preemptions
+        </span>
+        {policy && (
+          <span className="text-muted-foreground ml-auto">
+            {policy.kv_reserve > 0
+              ? `reserve ${formatTokens(policy.kv_reserve)} · backfill ${(policy.backfill_ms / 1000).toFixed(0)}s`
+              : "KV-fit gate off"}
+          </span>
+        )}
       </div>
 
-      {open ? (
-        <section
-          className="mt-3 border-t pt-3 first-of-type:border-t-0 first-of-type:pt-0"
-          aria-label={`Queue for ${snap.model}`}
-        >
-          <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
-            <span className="text-sm font-medium">{snap.model}</span>
-            <span className="tabular-nums">
-              KV <span className="font-semibold">{formatTokens(snap.kv_tokens_used)}</span> /{" "}
-              {formatTokens(snap.kv_tokens_total)}
-              <span className="text-muted-foreground">
-                ({pct(snap.kv_tokens_used, snap.kv_tokens_total).toFixed(0)}% held,{" "}
-                {formatTokens(l.cache)} of it cache)
-              </span>
-            </span>
-            <span className="tabular-nums">
-              gate room <span className="font-semibold">{formatTokens(l.room)}</span>
-            </span>
-            {snap.decode_tps > 0 && (
-              <span className="tabular-nums">{snap.decode_tps.toFixed(0)} tok/s decode</span>
-            )}
-            <span className="tabular-nums text-muted-foreground">
-              {snap.preemptions} preemptions
-            </span>
-            {policy && (
-              <span className="text-muted-foreground ml-auto">
-                {policy.kv_reserve > 0 ? (
-                  `reserve ${formatTokens(policy.kv_reserve)} · backfill ${
-                    (policy.backfill_ms / 1000).toFixed(0)
-                  }s`
-                ) : (
-                  "KV-fit gate off"
-                )}
-              </span>
-            )}
-          </div>
+      <KvPoolBar snapshot={snap} slots={slots} />
 
-          <KvPoolBar snapshot={snap} slots={slots} />
-
-          {/* Running batch */}
-          <div className="mt-3 overflow-x-auto">
-            <Table className="min-w-full">
-              <TableHeader>
-                <TableRow>
-                  {runningVisible.map((colId) => (
-                    <TableHead key={colId} className={cn(TH_CLASS, isRight(RUNNING_COLS, colId) && "text-right")}>
-                      {labelOf(RUNNING_COLS, colId)}
-                    </TableHead>
-                  ))}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {running.length > 0 ? (
-                  running.map((r) => (
-                    <FlipRow key={r.id} animate={!reducedMotion}>
-                      {runningVisible.map((colId) => (
-                        <TableCell key={colId} className={TD_CLASS}>
-                          {renderRunningCell(r, colId)}
-                        </TableCell>
-                      ))}
-                    </FlipRow>
-                  ))
-                ) : (
-                  <TableRow>
-                    <TableCell colSpan={Math.max(runningVisible.length, 1)} className={cn(TD_CLASS, "text-muted-foreground")}>
-                      Nothing running
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-
-          {/* Waiting line, in service order */}
-          {waiting.length > 0 && (
-            <div className="mt-3 overflow-x-auto">
-              <Table className="min-w-full">
-                <TableHeader>
-                  <TableRow>
-                    {waitingVisible.map((colId) => (
-                      <TableHead key={colId} className={cn(TH_CLASS, isRight(WAITING_COLS, colId) && "text-right")}>
-                        {labelOf(WAITING_COLS, colId)}
-                      </TableHead>
+      {hideEmptyTable ? (
+        <div className="mt-2 text-xs text-muted-foreground">Idle — nothing running</div>
+      ) : (
+        <div className="mt-3 overflow-x-auto">
+          <Table className="min-w-full">
+            <TableHeader>
+              <TableRow>
+                {runningVisible.map((colId) => (
+                  <TableHead key={colId} className={cn(TH_CLASS, isRight(RUNNING_COLS, colId) && "text-right")}>
+                    {labelOf(RUNNING_COLS, colId)}
+                  </TableHead>
+                ))}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {running.length > 0 ? (
+                running.map((r) => (
+                  <FlipRow key={r.id} animate={!reducedMotion}>
+                    {runningVisible.map((colId) => (
+                      <TableCell
+                        key={colId}
+                        className={cn(TD_CLASS, isRight(RUNNING_COLS, colId) && "text-right")}
+                      >
+                        {renderRunningCell(r, colId)}
+                      </TableCell>
                     ))}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {waiting.map((r) => {
-                    const key = requestKey(snap.model, r);
-                    const age = ages.age(key, r.age_s + dt);
-                    const held =
-                      r.held_s !== undefined ? ages.age(`h:${key}`, r.held_s + dt) : undefined;
-                    return (
-                      <FlipRow key={r.id} animate={!reducedMotion}>
-                        {waitingVisible.map((colId) => (
-                          <TableCell
-                            key={colId}
-                            className={cn(TD_CLASS, colId === "why" && "whitespace-normal")}
-                          >
-                            {renderWaitingCell(r, colId, age, held)}
-                          </TableCell>
-                        ))}
-                      </FlipRow>
-                    );
-                  })}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </section>
-      ) : null}
-    </Card>
+                  </FlipRow>
+                ))
+              ) : (
+                <TableRow>
+                  <TableCell colSpan={Math.max(runningVisible.length, 1)} className={cn(TD_CLASS, "text-muted-foreground")}>
+                    Nothing running
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      {waiting.length > 0 && (
+        <div className="mt-3 overflow-x-auto">
+          <Table className="min-w-full">
+            <TableHeader>
+              <TableRow>
+                {waitingVisible.map((colId) => (
+                  <TableHead key={colId} className={cn(TH_CLASS, isRight(WAITING_COLS, colId) && "text-right")}>
+                    {labelOf(WAITING_COLS, colId)}
+                  </TableHead>
+                ))}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {waiting.map((r) => {
+                const key = requestKey(snap.model, r);
+                const age = ages.age(key, r.age_s + dt);
+                const held =
+                  r.held_s !== undefined ? ages.age(`h:${key}`, r.held_s + dt) : undefined;
+                return (
+                  <FlipRow key={r.id} animate={!reducedMotion}>
+                    {waitingVisible.map((colId) => (
+                      <TableCell
+                        key={colId}
+                        className={cn(
+                          TD_CLASS,
+                          isRight(WAITING_COLS, colId) && "text-right",
+                          colId === "why" && "whitespace-normal",
+                        )}
+                      >
+                        {renderWaitingCell(r, colId, age, held)}
+                      </TableCell>
+                    ))}
+                  </FlipRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </section>
   );
 }
 
-// The fork animated its picker items, not the tables' rows; here the rows
-// slide to their new place when the order changes. FLIP: a row keeps its DOM
-// node across reorders (stable key), so the top measured in the last
-// useLayoutEffect is its "first" position and the new offsetTop its "last";
-// the inverse translate is applied, then transitioned to 0 over 200 ms.
-// offsetTop ignores the in-flight transform, so the measurement every frame
-// (the panel re-renders on the rAF clock) is always the settled position.
+function MediaQueueSection({
+  id,
+  model,
+  stats,
+  hue,
+  linkToModel,
+}: {
+  id: string;
+  model?: FleetModel;
+  stats: Stats;
+  hue?: string;
+  linkToModel: boolean;
+}) {
+  const jobs = stats.jobs ?? { running: 0, done: 0, failed: 0, total_ms: 0, last_ms: 0 };
+  const meanMs = jobs.done > 0 ? jobs.total_ms / jobs.done : 0;
+  const fleetWaiting = model?.waiting ?? 0;
+
+  return (
+    <section
+      className="border-t pt-3 first:border-t-0 first:pt-0"
+      aria-label={`Jobs for ${id}`}
+    >
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <ModelTitle id={id} hue={hue} linkToModel={linkToModel} />
+        {model && <StateBadge state={model.state} doing={model.doing} />}
+        <span className="tabular-nums">
+          <span className="font-semibold">{jobs.running}</span> active
+        </span>
+        {fleetWaiting > 0 && (
+          <span className="tabular-nums">
+            <span className="font-semibold">{fleetWaiting}</span> queued
+          </span>
+        )}
+        <span className="tabular-nums text-muted-foreground">
+          {jobs.done} done{jobs.failed > 0 ? ` (${jobs.failed} failed)` : ""}
+        </span>
+        {jobs.last_ms > 0 && (
+          <span className="tabular-nums text-muted-foreground">
+            last {formatDuration(jobs.last_ms)}
+          </span>
+        )}
+        {meanMs > 0 && (
+          <span className="tabular-nums text-muted-foreground">
+            mean {formatDuration(meanMs)}
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function StatusQueueSection({
+  model,
+  hue,
+  linkToModel,
+}: {
+  model: FleetModel;
+  hue?: string;
+  linkToModel: boolean;
+}) {
+  const detail =
+    model.state === "loading"
+      ? model.doing
+        ? `loading (${model.doing})…`
+        : "loading…"
+      : model.state === "waiting"
+        ? `waiting for ${model.waiting_for ?? "VRAM"}`
+        : model.doing ?? model.state;
+
+  return (
+    <section
+      className="border-t pt-3 first:border-t-0 first:pt-0"
+      aria-label={`Status for ${model.id}`}
+    >
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <ModelTitle id={model.id} hue={hue} linkToModel={linkToModel} />
+        <StateBadge state={model.state} doing={model.doing} />
+        <span className="text-muted-foreground">{detail}</span>
+        {(model.waiting ?? 0) > 0 && (
+          <span className="tabular-nums">
+            <span className="font-semibold">{model.waiting}</span> waiting
+          </span>
+        )}
+      </div>
+    </section>
+  );
+}
+
 function FlipRow({ animate, children }: { animate: boolean; children: ReactNode }) {
   const ref = useRef<HTMLTableRowElement | null>(null);
   const prevTop = useRef<number | null>(null);
@@ -670,8 +945,6 @@ function FlipRow({ animate, children }: { animate: boolean; children: ReactNode 
     const prev = prevTop.current;
     prevTop.current = top;
     if (!animate || prev === null || prev === top) return;
-    // A slide still in flight settles first; the new one starts from the
-    // row's current layout position.
     if (animating.current) {
       el.style.transform = "";
       el.style.transition = "";
@@ -679,7 +952,7 @@ function FlipRow({ animate, children }: { animate: boolean; children: ReactNode 
     }
     el.style.transition = "none";
     el.style.transform = `translateY(${prev - top}px)`;
-    void el.offsetHeight; // commit the start position before the transition
+    void el.offsetHeight;
     el.style.transition = "transform 200ms ease";
     el.style.transform = "translateY(0)";
     animating.current = true;

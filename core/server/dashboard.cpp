@@ -19,6 +19,7 @@
 #include "util/json.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -38,22 +39,47 @@ namespace server {
 /* ------------------------------------------------------------------ generation jobs */
 HttpResponse Server::run_job(const HttpRequest& q, HttpResponse (Server::*fn)(const HttpRequest&)) {
     const auto t0 = std::chrono::steady_clock::now();
+    HttpMeta meta = copy_http_meta(q);
+    std::string kind = "image";
+    if (q.path.find("/audio/speech") != std::string::npos) kind = "tts";
+    else if (q.path == "/generate") kind = "shape";
     jobs_.running.fetch_add(1, std::memory_order_relaxed);
-    auto finish = [this, t0](bool ok) {
-        const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        jobs_.running.fetch_sub(1, std::memory_order_relaxed);
-        if (!ok) { jobs_.failed.fetch_add(1, std::memory_order_relaxed); return; }
-        jobs_.done.fetch_add(1, std::memory_order_relaxed);
-        jobs_.total_ms.fetch_add(ms, std::memory_order_relaxed);
-        jobs_.last_ms.store(ms, std::memory_order_relaxed);
-    };
     HttpResponse r = (this->*fn)(q);
-    if (!r.streaming()) {
+    const bool sse = r.streaming();
+    std::shared_ptr<JobOutcome> outcome = r.job_outcome;
+    auto finish = [this, t0, meta = std::move(meta), kind = std::move(kind), sse, outcome](bool ok) mutable {
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        const int64_t ms_i = (int64_t)std::llround(ms);
+        jobs_.running.fetch_sub(1, std::memory_order_relaxed);
+        const bool job_ok = outcome ? (ok && outcome->code < 400 && outcome->err.empty()) : ok;
+        if (!job_ok) {
+            jobs_.failed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            jobs_.done.fetch_add(1, std::memory_order_relaxed);
+            jobs_.total_ms.fetch_add(ms_i, std::memory_order_relaxed);
+            jobs_.last_ms.store(ms_i, std::memory_order_relaxed);
+        }
+        if (outcome && outcome->admitted) {
+            int code = outcome->code;
+            std::string err = outcome->err;
+            if (!ok && err.empty()) {
+                code = 200;
+                err = "client disconnected";
+            }
+            if (meta.tag.empty() && !outcome->meta.empty()) meta.tag = outcome->meta;
+            emit_job_record(meta, opt_.model_id, kind, outcome->rid, sse, code, err, ms);
+        }
+    };
+    if (!sse) {
         finish(r.status < 400);
         return r;
     }
     std::function<void(bool)> prev = std::move(r.on_close);
-    r.on_close = [prev, finish](bool ok) { if (prev) prev(ok); finish(ok); };
+    r.on_close = [prev = std::move(prev), finish = std::move(finish)](bool ok) mutable {
+        if (prev) prev(ok);
+        finish(ok);
+    };
     return r;
 }
 

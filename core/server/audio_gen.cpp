@@ -433,10 +433,14 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
             return error_response(e, req.peer);
         }
     }
+    auto outcome = std::make_shared<JobOutcome>();
+    outcome->admitted = true;
+    outcome->rid = random_id("tts_");
+    outcome->meta = fmt;
     RAD_INFO("audio: %lld prompt tokens, up to %lld frames, seed=%llu", (long long)n_tok,
              (long long)frames_max, (unsigned long long)seed);
 
-    if (sse || raw) return stream_speech(ticket, info, n_tok, seed, sse, fmt == "wav");
+    if (sse || raw) return stream_speech(ticket, info, n_tok, seed, sse, fmt == "wav", outcome);
 
     /* ---- the windows as they are played, in order */
     std::vector<gen::AudioChunk> chunks;
@@ -452,12 +456,21 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
             ticket->cancel.store(true);
             release(1);
             metrics_.observe_http(499);
-            return HttpResponse::text(499, "client closed request\n");
+            outcome->code = 200;
+            outcome->err = "client disconnected";
+            HttpResponse res = HttpResponse::text(499, "client closed request\n");
+            res.job_outcome = outcome;
+            return res;
         }
         if (stopping_.load()) {
             ticket->cancel.store(true);
             release(1);
-            return error_response(err_overloaded("the server is shutting down"), req.peer);
+            ApiError e = err_overloaded("the server is shutting down");
+            outcome->code = e.status;
+            outcome->err = e.message;
+            HttpResponse res = error_response(e, req.peer);
+            res.job_outcome = outcome;
+            return res;
         }
     }
     release(1);
@@ -469,7 +482,11 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
         e.status = client ? 400 : 500;
         e.type = client ? "invalid_request_error" : "server_error";
         e.message = ticket->why().empty() ? "the audio generator failed" : ticket->why();
-        return error_response(e, req.peer);
+        outcome->code = e.status;
+        outcome->err = e.message;
+        HttpResponse res = error_response(e, req.peer);
+        res.job_outcome = outcome;
+        return res;
     }
     std::sort(chunks.begin(), chunks.end(), [](const gen::AudioChunk& a, const gen::AudioChunk& b) {
         return a.window < b.window;
@@ -497,6 +514,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
     res.set_header("X-Audio-Sample-Rate", std::to_string(info.sample_rate));
     res.set_header("X-Audio-Channels", std::to_string(info.channels));
     res.set_header("X-Seed", std::to_string(seed));
+    res.job_outcome = outcome;
     metrics_.observe_http(200);
     return res;
 }
@@ -505,7 +523,7 @@ HttpResponse Server::handle_speech(const HttpRequest& req) {
  * may finish them out of order), as bytes or as `speech.audio.delta` events. */
 HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
                                    const AudioGenInfo& info, int64_t n_tok, uint64_t seed,
-                                   bool sse, bool wav) {
+                                   bool sse, bool wav, std::shared_ptr<JobOutcome> outcome) {
     HttpResponse res;
     res.status = 200;
     res.content_type = sse ? "text/event-stream" : wav ? "audio/wav" : "audio/pcm";
@@ -513,6 +531,7 @@ HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
     res.set_header("X-Audio-Sample-Rate", std::to_string(info.sample_rate));
     res.set_header("X-Audio-Channels", std::to_string(info.channels));
     res.set_header("X-Seed", std::to_string(seed));
+    res.job_outcome = outcome;
     struct State {
         std::map<int32_t, std::vector<float>> held;   /* windows ahead of the next one */
         int32_t next = 0;
@@ -521,7 +540,7 @@ HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
     auto st = std::make_shared<State>();
     st->header = !wav || sse;
     const int64_t rate = info.sample_rate, channels = info.channels;
-    res.next = [this, ticket, st, sse, rate, channels, n_tok](std::string& chunk) -> bool {
+    res.next = [this, ticket, st, sse, rate, channels, n_tok, outcome](std::string& chunk) -> bool {
         if (st->finished) return false;
         chunk.clear();
         if (!st->header) {
@@ -553,12 +572,23 @@ HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
             chunk += "event: speech.audio.delta\ndata: " + json_dump(ev) + "\n\n";
             return true;
         }
-        if (to) return !stopping_.load();
+        if (to) {
+            if (stopping_.load()) {
+                if (outcome) { outcome->code = 503; outcome->err = "the server is shutting down"; }
+                return false;
+            }
+            return true;
+        }
         st->finished = true;
         if (!st->released) { st->released = true; release(1); }
+        const bool failed = ticket->status() < 0 || st->next == 0;
+        if (failed && outcome) {
+            outcome->code = ticket->status() == RAD_E_INVAL ? 400 : 500;
+            outcome->err = ticket->why().empty() ? "the audio generator failed" : ticket->why();
+        }
         if (!sse) return !chunk.empty();
         json ev;
-        if (ticket->status() < 0 || st->next == 0) {
+        if (failed) {
             ev["type"] = "speech.audio.error";
             ev["error"] = json{
                 { "message", ticket->why().empty() ? "the audio generator failed" : ticket->why() },
@@ -572,8 +602,14 @@ HttpResponse Server::stream_speech(std::shared_ptr<gen::AudioTicket> ticket,
         chunk += "event: " + ev["type"].get<std::string>() + "\ndata: " + json_dump(ev) + "\n\n";
         return true;
     };
-    res.on_close = [this, ticket, st](bool ok) {
-        if (!ok) ticket->cancel.store(true);
+    res.on_close = [this, ticket, st, outcome](bool ok) {
+        if (!ok) {
+            ticket->cancel.store(true);
+            if (!st->finished && outcome && outcome->err.empty()) {
+                outcome->code = 200;
+                outcome->err = "client disconnected";
+            }
+        }
         if (!st->released) { st->released = true; release(1); }
     };
     metrics_.observe_http(200);

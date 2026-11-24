@@ -304,4 +304,283 @@ TEST(a_body_carries_the_latest_sample_s_object_as_live) {
     CHECK(json::parse(h.model_body("unknown", 0))["live"].is_null());
 }
 
+namespace {
+int key_index(const json& keys, const std::string& name) {
+    for (size_t i = 0; i < keys.size(); ++i)
+        if (keys[i].is_string() && keys[i].get<std::string>() == name) return (int)i;
+    return -1;
+}
+}  // namespace
+
+TEST(multi_model_global_n_survives_restart_and_ignores_tmp_and_torn_lines) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    {
+        History h;
+        h.set_dir(dir);
+        h.request_done("qwen27b", json::parse(R"({"t0":1000,"t1":1100,"model":"rad"})"));
+        h.request_done("qwen3-asr", json::parse(R"({"t0":1050,"t1":1200,"model":"qwen3-asr","kind":"asr","audio_s":3.5})"));
+        h.request_done("qwen-image-turbo", json::parse(R"({"t0":1100,"t1":1300,"model":"qwen-image-turbo","kind":"image"})"));
+    }
+    /* A leftover .jsonl.tmp file and a torn last line without '\n' must be ignored at startup. */
+    {
+        std::ofstream tmp(dir + "/qwen27b.jsonl.tmp");
+        tmp << "{\"n\":99999,\"t1\":99999}\n";
+    }
+    {
+        std::ofstream torn(dir + "/qwen3-asr.jsonl", std::ios::app);
+        torn << "{\"n\":88888,\"t1\":";
+    }
+
+    History h;
+    h.set_dir(dir);
+    h.request_done("qwen27b", json::parse(R"({"t0":1400,"t1":1500,"model":"qwen27b"})"));
+
+    const json page = json::parse(h.requests_page(RequestsQuery{}));
+    const json& keys = page["keys"];
+    const int i_n = key_index(keys, "n");
+    const int i_fm = key_index(keys, "fm");
+    const int i_model = key_index(keys, "model");
+    const int i_kind = key_index(keys, "kind");
+    const int i_audio = key_index(keys, "audio_s");
+    REQUIRE(i_n >= 0 && i_fm >= 0 && i_model >= 0 && i_kind >= 0 && i_audio >= 0);
+    CHECK_EQ(page["total"].get<int64_t>(), (int64_t)4);
+    CHECK(!page["has_more"].get<bool>());
+    CHECK_EQ(page["min_n"].get<int64_t>(), (int64_t)1);
+    REQUIRE_EQ((int)page["rows"].size(), 4);
+    CHECK_EQ(page["rows"][0][i_n].get<int64_t>(), (int64_t)1);
+    CHECK_EQ(page["rows"][0][i_fm].get<std::string>(), "qwen27b");
+    CHECK_EQ(page["rows"][0][i_model].get<std::string>(), "rad");
+    CHECK_EQ(page["rows"][0][i_kind].get<std::string>(), "chat");
+    CHECK_EQ(page["rows"][1][i_n].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(page["rows"][1][i_fm].get<std::string>(), "qwen3-asr");
+    CHECK_EQ(page["rows"][1][i_kind].get<std::string>(), "asr");
+    CHECK_EQ(page["rows"][1][i_audio].get<double>(), 3.5);
+    CHECK_EQ(page["rows"][2][i_n].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(page["rows"][2][i_fm].get<std::string>(), "qwen-image-turbo");
+    CHECK_EQ(page["rows"][2][i_kind].get<std::string>(), "image");
+    /* Global monotonic n resumed at 4 (not 88889 or 100000). */
+    CHECK_EQ(page["rows"][3][i_n].get<int64_t>(), (int64_t)4);
+    CHECK_EQ(page["rows"][3][i_fm].get<std::string>(), "qwen27b");
+    remove_dir(dir);
+}
+
+TEST(unknown_model_lookup_does_not_pollute_logs) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    History h;
+    h.set_dir(dir);
+    h.request_done("qwen27b", json::parse(R"({"t0":100,"t1":200})"));
+
+    CHECK_EQ((int)h.model_since("ghost", 0)["requests"].size(), 0);
+    CHECK_EQ((int)json::parse(h.model_body("ghost", 0))["requests"].size(), 0);
+    RequestsQuery gq;
+    gq.model = "ghost";
+    const json gp = json::parse(h.requests_page(gq));
+    CHECK_EQ((int)gp["rows"].size(), 0);
+    CHECK_EQ(gp["total"].get<int64_t>(), (int64_t)0);
+    CHECK(!gp["has_more"].get<bool>());
+    CHECK_EQ(gp["min_n"].get<int64_t>(), (int64_t)0);
+
+    const json all = json::parse(h.requests_page(RequestsQuery{}));
+    CHECK_EQ((int)all["rows"].size(), 1);
+    CHECK_EQ(all["total"].get<int64_t>(), (int64_t)1);
+    remove_dir(dir);
+}
+
+TEST(requests_page_paging_filtering_fields_and_legacy_backfill) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    /* Legacy lines without fm or kind across two models. */
+    {
+        std::ofstream a(dir + "/m1.jsonl");
+        a << "{\"n\":1,\"t0\":1000,\"t1\":1100,\"dms\":50}\n";
+        a << "{\"n\":3,\"t0\":1200,\"t1\":1300,\"dms\":60}\n";
+        a << "{\"n\":5,\"t0\":1400,\"t1\":1500,\"dms\":70}\n";
+        std::ofstream b(dir + "/m2.jsonl");
+        b << "{\"n\":2,\"t0\":1100,\"t1\":1200,\"dms\":80}\n";
+        b << "{\"n\":4,\"t0\":1300,\"t1\":1400,\"dms\":90}\n";
+        b << "{\"n\":6,\"t0\":1500,\"t1\":1600,\"dms\":100}\n";
+    }
+    History h;
+    h.set_dir(dir);
+
+    /* Newest page of 2. */
+    RequestsQuery q1;
+    q1.limit = 2;
+    const json p1 = json::parse(h.requests_page(q1));
+    const int i_n = key_index(p1["keys"], "n");
+    const int i_fm = key_index(p1["keys"], "fm");
+    const int i_kind = key_index(p1["keys"], "kind");
+    REQUIRE(i_n >= 0 && i_fm >= 0 && i_kind >= 0);
+    CHECK_EQ(p1["total"].get<int64_t>(), (int64_t)6);
+    CHECK(p1["has_more"].get<bool>());
+    CHECK_EQ(p1["min_n"].get<int64_t>(), (int64_t)5);
+    REQUIRE_EQ((int)p1["rows"].size(), 2);
+    CHECK_EQ(p1["rows"][0][i_n].get<int64_t>(), (int64_t)5);
+    CHECK_EQ(p1["rows"][0][i_fm].get<std::string>(), "m1");
+    CHECK_EQ(p1["rows"][0][i_kind].get<std::string>(), "chat");
+    CHECK_EQ(p1["rows"][1][i_n].get<int64_t>(), (int64_t)6);
+    CHECK_EQ(p1["rows"][1][i_fm].get<std::string>(), "m2");
+
+    /* Older page via before_n=5. */
+    RequestsQuery q2;
+    q2.limit = 2;
+    q2.before_n = p1["min_n"].get<int64_t>();
+    const json p2 = json::parse(h.requests_page(q2));
+    CHECK(p2["has_more"].get<bool>());
+    CHECK_EQ(p2["min_n"].get<int64_t>(), (int64_t)3);
+    REQUIRE_EQ((int)p2["rows"].size(), 2);
+    CHECK_EQ(p2["rows"][0][i_n].get<int64_t>(), (int64_t)3);
+    CHECK_EQ(p2["rows"][1][i_n].get<int64_t>(), (int64_t)4);
+
+    /* Final older page via before_n=3. */
+    RequestsQuery q3;
+    q3.limit = 2;
+    q3.before_n = p2["min_n"].get<int64_t>();
+    const json p3 = json::parse(h.requests_page(q3));
+    CHECK(!p3["has_more"].get<bool>());
+    CHECK_EQ(p3["min_n"].get<int64_t>(), (int64_t)1);
+    REQUIRE_EQ((int)p3["rows"].size(), 2);
+    CHECK_EQ(p3["rows"][0][i_n].get<int64_t>(), (int64_t)1);
+    CHECK_EQ(p3["rows"][1][i_n].get<int64_t>(), (int64_t)2);
+
+    /* Gap catch-up via after_n=3 (with limit=2 takes oldest 2 after 3: n=4, 5). */
+    RequestsQuery qa;
+    qa.after_n = 3;
+    qa.limit = 2;
+    const json pa = json::parse(h.requests_page(qa));
+    CHECK(pa["has_more"].get<bool>());
+    REQUIRE_EQ((int)pa["rows"].size(), 2);
+    CHECK_EQ(pa["rows"][0][i_n].get<int64_t>(), (int64_t)4);
+    CHECK_EQ(pa["rows"][1][i_n].get<int64_t>(), (int64_t)5);
+
+    /* Time-range + fields subset (ignoring unknown fields). */
+    RequestsQuery qt;
+    qt.t_from = 1250;
+    qt.t_to = 1350;
+    qt.fields = { "t0", "t1", "dms", "fm", "not_a_real_key" };
+    const json pt = json::parse(h.requests_page(qt));
+    REQUIRE_EQ((int)pt["keys"].size(), 4);
+    CHECK_EQ(pt["keys"][0].get<std::string>(), "t0");
+    CHECK_EQ(pt["keys"][1].get<std::string>(), "t1");
+    CHECK_EQ(pt["keys"][2].get<std::string>(), "dms");
+    CHECK_EQ(pt["keys"][3].get<std::string>(), "fm");
+    /* Overlapping [1250, 1350]: n=3 [1200,1300] (t1=1300>=1250, t0=1200<=1350) and n=4 [1300,1400]. */
+    REQUIRE_EQ((int)pt["rows"].size(), 2);
+    CHECK_EQ(pt["rows"][0][3].get<std::string>(), "m1");
+    CHECK_EQ(pt["rows"][1][3].get<std::string>(), "m2");
+    remove_dir(dir);
+}
+
+TEST(handle_history_requests_enforces_operator_ok_for_all_and_single_model) {
+    History h;
+    h.request_done("qwen27b", json::parse(R"({"t0":100,"t1":200})"));
+    h.request_done("qwen3-asr", json::parse(R"({"t0":200,"t1":300,"kind":"asr"})"));
+
+    HttpRequest req_all;
+    req_all.path = "/history/requests";
+    const HttpResponse r_all_403 = handle_history_requests(h, req_all, false);
+    CHECK_EQ(r_all_403.status, 403);
+    CHECK_EQ(json::parse(r_all_403.body)["error"]["type"].get<std::string>(), "permission_error");
+
+    HttpRequest req_model;
+    req_model.path = "/history/requests";
+    req_model.query["model"] = "qwen27b";
+    const HttpResponse r_model_403 = handle_history_requests(h, req_model, false);
+    CHECK_EQ(r_model_403.status, 403);
+
+    const HttpResponse r_all_200 = handle_history_requests(h, req_all, true);
+    CHECK_EQ(r_all_200.status, 200);
+    CHECK_EQ((int)json::parse(r_all_200.body)["rows"].size(), 2);
+
+    const HttpResponse r_model_200 = handle_history_requests(h, req_model, true);
+    CHECK_EQ(r_model_200.status, 200);
+    CHECK_EQ((int)json::parse(r_model_200.body)["rows"].size(), 1);
+
+    HttpRequest req_fields;
+    req_fields.path = "/history/requests";
+    req_fields.query["fields"] = "n,fm,kind";
+    req_fields.query["limit"] = "1";
+    const HttpResponse r_f = handle_history_requests(h, req_fields, true);
+    CHECK_EQ(r_f.status, 200);
+    const json jf = json::parse(r_f.body);
+    REQUIRE_EQ((int)jf["keys"].size(), 3);
+    CHECK(jf["has_more"].get<bool>());
+    REQUIRE_EQ((int)jf["rows"].size(), 1);
+    CHECK_EQ(jf["rows"][0][1].get<std::string>(), "qwen3-asr");
+}
+
+TEST(model_body_and_since_omit_requests_when_not_operator) {
+    History h;
+    h.request_done("m", json::parse(R"({"t1":1000})"));
+    const json s_no = h.model_since("m", 0, false);
+    CHECK(!s_no.contains("requests"));
+    const json b_no = json::parse(h.model_body("m", 0, false));
+    CHECK(!b_no.contains("requests"));
+    const json b_yes = json::parse(h.model_body("m", 0, true));
+    REQUIRE(b_yes.contains("requests"));
+    CHECK_EQ((int)b_yes["requests"].size(), 1);
+}
+
+TEST(fleet_body_activity_returns_non_adapter_model_stats_tail_and_oldest_n) {
+    History h;
+    const json s = stats(7, 100, 2.2e9, 10);
+    h.model_sample("qwen27b", s, 10.0, R"({"decode_tps":68.5})");
+    h.model_sample("qwen27b:lora", s, 10.0, R"({"decode_tps":68.5})");
+    h.model_sample("qwen3-asr", s, 10.0, R"({"decode_tps":12.0})");
+    h.fleet_sample(json::parse(R"({"models":[],"cards":[]})"), 10.0, R"({"models":[]})");
+
+    h.request_done("qwen27b", json::parse(R"({"t1":1000})"));
+    h.request_done("qwen3-asr", json::parse(R"({"t1":1100,"kind":"asr"})"));
+    h.request_done("qwen27b", json::parse(R"({"t1":1200})"));
+
+    /* When include_activity == false, matches plain fleet_body(0). */
+    CHECK_EQ(h.fleet_body(0, false, 0, {"qwen27b"}), h.fleet_body(0));
+
+    const json a1 = json::parse(h.fleet_body(0, true, 1, {"qwen27b", "qwen3-asr"}));
+    REQUIRE(a1.contains("model_stats"));
+    CHECK(a1["model_stats"].contains("qwen27b"));
+    CHECK(a1["model_stats"].contains("qwen3-asr"));
+    CHECK(!a1["model_stats"].contains("qwen27b:lora"));
+    CHECK_EQ(a1["model_stats"]["qwen27b"]["decode_tps"].get<double>(), 68.5);
+    CHECK_EQ(a1["oldest_n"].get<int64_t>(), (int64_t)0);
+    REQUIRE_EQ((int)a1["requests"].size(), 2);
+    CHECK_EQ(a1["requests"][0]["n"].get<int64_t>(), (int64_t)2);
+    CHECK_EQ(a1["requests"][1]["n"].get<int64_t>(), (int64_t)3);
+
+    /* Exceed kRequests in qwen27b so its ring evicts older records -> oldest_n reports front n. */
+    for (int i = 0; i < History::kRequests + 10; ++i)
+        h.request_done("qwen27b", json::parse(R"({"t1":)" + std::to_string(2000 + i) + "}"));
+    /* Total requests in qwen27b: 2 + (500 + 10) = 512. Evicted: 12 (n=1, 3, 4..13).
+     * Oldest kept in qwen27b ring is n=14. */
+    const json a2 = json::parse(h.fleet_body(0, true, 500, {"qwen27b", "qwen3-asr"}));
+    CHECK_EQ(a2["oldest_n"].get<int64_t>(), (int64_t)14);
+    CHECK(!a2["requests"].empty());
+    CHECK_EQ(a2["requests"][0]["n"].get<int64_t>(), (int64_t)501);
+}
+
+TEST(request_done_handles_invalid_utf8_without_throwing) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    History h;
+    h.set_dir(dir);
+    json rec = json::object();
+    rec["t1"] = 1000;
+    rec["err"] = std::string("bad\xff\xfe\x80utf8");
+    rec["ua"] = std::string("agent\xc3");
+    h.request_done("qwen27b", std::move(rec));
+
+    const json m = h.model_since("qwen27b", 0);
+    REQUIRE_EQ((int)m["requests"].size(), 1);
+    const std::string dumped = m.dump();
+    CHECK(dumped.find("\xef\xbf\xbd") != std::string::npos);
+
+    const json page = json::parse(h.requests_page(RequestsQuery{}));
+    REQUIRE_EQ((int)page["rows"].size(), 1);
+    const json fl = json::parse(h.fleet_body(0, true, 0, {"qwen27b"}));
+    REQUIRE_EQ((int)fl["requests"].size(), 1);
+    remove_dir(dir);
+}
+
 RAD_TEST_MAIN()

@@ -72,6 +72,17 @@ struct PromptInput {
     std::shared_ptr<mm::PromptMedia> media;
 };
 
+/* (local) Sanitized, UTF-8-bounded HTTP metadata copied from an incoming HttpRequest for
+ * activity history records across chat, ASR, realtime, media, and async video endpoints. */
+struct HttpMeta {
+    std::string peer;
+    std::string path;
+    std::string user_agent;
+    std::string forwarded_for;
+    std::string session_header;
+    std::string tag;
+};
+
 struct OaiRequest {
     Endpoint    endpoint = Endpoint::Chat;
     std::string model;

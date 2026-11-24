@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -222,6 +223,17 @@ struct Server::TranscriptionJob {
     bool    stream_started = false;
     bool    done_sent = false;
     std::string streamed;
+
+    /* (local) One History record per HTTP transcription request, aggregated across waves. */
+    HttpMeta    meta;
+    int64_t     t_start_ns = 0;
+    double      audio_s = 0.0;
+    std::string req_model;
+    bool        sse = false;
+    bool        recorded = false;
+    int64_t     n_decode = 0;
+    double      pms = 0.0, dms = 0.0;
+    bool        has_pms = false, has_timings = false;
 };
 
 HttpResponse Server::handle_transcription(const HttpRequest& req) {
@@ -310,6 +322,15 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
     job->language_text = forced.empty() ? std::string() : speech_language_text(f, forced);
     job->replies.assign(job->cuts.size(), std::string());
     job->heard.assign(job->cuts.size(), Heard{});
+    job->meta = copy_http_meta(req);
+    job->t_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    job->audio_s = (double)job->samples.size() / (double)rate;
+    {
+        const std::string fm = field("model");
+        job->req_model = fm.empty() ? opt_.model_id : fm;
+    }
+    job->sse = stream;
 
     OaiRequest& b = job->base;
     b.endpoint = Endpoint::Completion;
@@ -380,8 +401,34 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         job->running = true;
         return true;
     };
+    auto emit_once = [self, job](Finish fin) {
+        if (job->recorded) return;
+        job->recorded = true;
+        if (job->next == 0 && !job->running) return;
+        const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const double total_ms = std::max(0.0, (double)(now_ns - job->t_start_ns) * 1e-6);
+        const int code = fin == Finish::Error ? 500 : 200;
+        const std::string err = fin == Finish::Error ? "the engine failed the request"
+                              : fin == Finish::Cancelled ? "client disconnected" : "";
+        const double pms = job->has_pms ? job->pms : -1.0;
+        const double dms = job->has_timings ? job->dms : -1.0;
+        const double pps = (job->n_prompt > 0 && pms > 0.0) ? (double)job->n_prompt * 1000.0 / pms : 0.0;
+        const double tps = (job->n_decode > 0 && dms > 0.0) ? (double)job->n_decode * 1000.0 / dms : 0.0;
+        self->emit_job_record(job->meta, job->req_model, "asr", job->base.id, job->sse, code, err,
+                              total_ms, job->audio_s, job->n_prompt, job->n_gen, /*cache_tok=*/0,
+                              pms, dms, pps, tps);
+    };
+    auto add_wave_timings = [self, job]() {
+        const TimingsOut wt = self->timings_of(job->gens, -1);
+        if (!wt.valid) return;
+        job->has_timings = true;
+        job->dms += wt.predicted_ms;
+        job->n_decode += wt.decode_n;
+        if (wt.prompt_ms >= 0.0) { job->has_pms = true; job->pms += wt.prompt_ms; }
+    };
     /* A wave that has finished: its replies kept, its sequences retired. Error when one failed. */
-    auto finish_wave = [self, job, fp](std::string* failure) -> bool {
+    auto finish_wave = [self, job, fp, add_wave_timings](std::string* failure) -> bool {
         Finish overall = Finish::Stop;
         for (const auto& g : job->gens) {
             const size_t k = job->next + (size_t)g.prompt_index;
@@ -393,7 +440,8 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
                 if (failure) *failure = engine_failure(*g.sink);
             }
         }
-        self->record(job->r, job->gens, overall);
+        add_wave_timings();
+        self->record(job->r, job->gens, overall, /*quiet=*/false, /*to_history=*/false);
         self->retire(job->gens);
         job->next += job->r.prompts.size();
         job->running = false;
@@ -428,6 +476,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
         while (job->next < job->cuts.size()) {
             ApiError err;
             if (!start_wave(&err)) {
+                emit_once(Finish::Error);
                 release_job();
                 return error_response(err, req.peer);
             }
@@ -436,8 +485,12 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
                 if (all_done(job->gens)) break;
                 if (req.peer_gone() || stopping_.load()) {
                     cancel_all(job->gens, req.peer_gone());
-                    record(job->r, job->gens, Finish::Cancelled);
+                    for (const auto& g : job->gens) job->n_gen += g.sink->n_produced();
+                    add_wave_timings();
+                    record(job->r, job->gens, Finish::Cancelled, /*quiet=*/false, /*to_history=*/false);
                     retire(job->gens);
+                    emit_once(Finish::Cancelled);
+                    job->running = false;
                     release_job();
                     if (req.peer_gone()) {
                         metrics_.observe_http(499);
@@ -449,10 +502,12 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             }
             std::string failure;
             if (!finish_wave(&failure)) {
+                emit_once(Finish::Error);
                 release_job();
                 return error_response(internal(failure), req.peer);
             }
         }
+        emit_once(Finish::Stop);
         release_job();
         const std::string text = joined();
         metrics_.observe_http(200);
@@ -500,7 +555,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
     res.set_header("X-Accel-Buffering", "no");
     auto peer_closed = req.closed;
     res.next = [self, job, peer_closed, fp, start_wave, finish_wave, joined, usage, internal,
-                release_job](std::string& out) -> bool {
+                release_job, emit_once](std::string& out) -> bool {
         out.clear();
         if (job->done_sent) return false;
         if (peer_closed && peer_closed()) return false;
@@ -544,6 +599,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             if (!finish_wave(&failure)) {
                 out += sse_error(internal(failure));
                 job->done_sent = true;
+                emit_once(Finish::Error);
                 release_job();
                 return true;
             }
@@ -552,6 +608,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
                 if (!start_wave(&err)) {
                     out += sse_error(err);
                     job->done_sent = true;
+                    emit_once(Finish::Error);
                     release_job();
                     return true;
                 }
@@ -559,6 +616,7 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             return true;
         }
         if (!job->running && job->stream_clip >= job->cuts.size()) {
+            emit_once(Finish::Stop);
             release_job();
             json o;
             o["type"] = "transcript.text.done";
@@ -573,12 +631,17 @@ HttpResponse Server::handle_transcription(const HttpRequest& req) {
             for (auto& g : job->gens) if (!g.closed) { g.sink->wait(); break; }
         return true;
     };
-    res.on_close = [self, job, release_job](bool) {
+    res.on_close = [self, job, release_job, emit_once, add_wave_timings](bool) {
         if (job->running) {
             self->cancel_all(job->gens, true);
-            self->record(job->r, job->gens, Finish::Cancelled);
+            for (const auto& g : job->gens) job->n_gen += g.sink->n_produced();
+            add_wave_timings();
+            self->record(job->r, job->gens, Finish::Cancelled, /*quiet=*/false, /*to_history=*/false);
             self->retire(job->gens);
+            emit_once(Finish::Cancelled);
             job->running = false;
+        } else {
+            emit_once(Finish::Cancelled);
         }
         release_job();
     };

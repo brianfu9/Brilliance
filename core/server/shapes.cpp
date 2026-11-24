@@ -31,6 +31,7 @@
 
 #include "util/json.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <thread>
@@ -176,6 +177,8 @@ int finish_file(gen::ShapeTicket& t, const gen::ShapeGenInfo& info, const std::s
 
 struct Server::ShapeJob {
     std::string uid, type;
+    HttpMeta    meta;
+    int64_t     t_start_ns = 0;
     int64_t     created_at = 0, done_at = 0;
     std::shared_ptr<gen::ShapeTicket> ticket;
     std::thread worker;
@@ -204,18 +207,33 @@ HttpResponse Server::handle_shape_generate(const HttpRequest& req) {
     if (const int st = deps_.shapes->submit(std::move(a.req), &why); st < 0)
         return error_response(st == RAD_E_INVAL ? err_bad("image", why) : err_overloaded(why),
                               req.peer);
+    auto outcome = std::make_shared<JobOutcome>();
+    outcome->admitted = true;
+    outcome->rid = random_id("shape_");
+    outcome->meta = a.type;
     while (!t->wait(500))
         if (stopping_.load()) {
             t->cancel.store(true);
-            return error_response(err_overloaded("the server is stopping"), req.peer);
+            ApiError e = err_overloaded("the server is stopping");
+            outcome->code = e.status;
+            outcome->err = e.message;
+            HttpResponse res = error_response(e, req.peer);
+            res.job_outcome = outcome;
+            return res;
         }
     std::string file, mime;
-    if (const int st = finish_file(*t, info, a.type, &file, &mime, &why); st < 0)
-        return error_response(st == RAD_E_INVAL ? err_bad("image", why) : err_internal(why),
-                              req.peer);
+    if (const int st = finish_file(*t, info, a.type, &file, &mime, &why); st < 0) {
+        ApiError e = st == RAD_E_INVAL ? err_bad("image", why) : err_internal(why);
+        outcome->code = e.status;
+        outcome->err = e.message;
+        HttpResponse res = error_response(e, req.peer);
+        res.job_outcome = outcome;
+        return res;
+    }
     HttpResponse res;
     res.content_type = mime;
     res.body = std::move(file);
+    res.job_outcome = outcome;
     return res;
 }
 
@@ -231,21 +249,34 @@ void Server::shape_work(std::shared_ptr<ShapeJob> j) {
     std::string file, mime, why;
     const int st = t.finished() ? finish_file(t, info, j->type, &file, &mime, &why)
                                 : RAD_E_CANCELLED;
-    std::lock_guard<std::mutex> lk(shapes_m_);
-    j->finished = true;
-    j->done_at = unix_now();
-    if (st < 0) {
-        j->failed = true;
-        j->message = why.empty() ? std::string(rad_strerror(st)) : why;
-    } else {
-        j->file = std::move(file);
+    bool rec_failed = false;
+    std::string rec_err;
+    {
+        std::lock_guard<std::mutex> lk(shapes_m_);
+        j->finished = true;
+        j->done_at = unix_now();
+        if (st < 0) {
+            j->failed = true;
+            j->message = why.empty() ? std::string(rad_strerror(st)) : why;
+        } else {
+            j->file = std::move(file);
+        }
+        rec_failed = j->failed;
+        rec_err = j->message;
+        /* A finished shape can be read without this server, which may be gone when its client asks. */
+        if (deps_.front)
+            deps_.front->keep_job(j->uid, j->done_at + opt_.video_ttl_s, opt_.max_videos,
+                                  [j](const HttpRequest&) -> HttpResponse {
+                return HttpResponse::json_body(200, json_dump(shape_status(*j)));
+            });
     }
-    /* A finished shape can be read without this server, which may be gone when its client asks. */
-    if (deps_.front)
-        deps_.front->keep_job(j->uid, j->done_at + opt_.video_ttl_s, opt_.max_videos,
-                              [j](const HttpRequest&) -> HttpResponse {
-            return HttpResponse::json_body(200, json_dump(shape_status(*j)));
-        });
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double total_ms = std::max(0.0, (double)(now_ns - j->t_start_ns) * 1e-6);
+    HttpMeta rec_meta = j->meta;
+    if (rec_meta.tag.empty() && !j->type.empty()) rec_meta.tag = j->type;
+    emit_job_record(rec_meta, opt_.model_id, "shape", j->uid, /*sse=*/false,
+                    rec_failed ? 500 : 200, rec_err, total_ms);
 }
 
 json Server::shape_status(const ShapeJob& j) {
@@ -309,6 +340,9 @@ HttpResponse Server::handle_shape_send(const HttpRequest& req) {
     auto j = std::make_shared<ShapeJob>();
     j->uid = random_id("shape_");
     j->type = a.type;
+    j->meta = copy_http_meta(req);
+    j->t_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     j->created_at = unix_now();
     j->ticket = a.req->ticket;
     std::string why;

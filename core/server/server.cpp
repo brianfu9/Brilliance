@@ -1057,7 +1057,7 @@ static SuccessReason to_reason(Finish f) {
 }
 
 void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall,
-                    bool quiet) {
+                    bool quiet, bool to_history) {
     int64_t n_prompt = 0;
     for (const auto& p : r.prompts) n_prompt += (int64_t)p.tokens.size();
 
@@ -1104,12 +1104,70 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
                (long long)n_prompt, (long long)(t.valid ? t.cache_n : 0), (long long)n_gen,
                reason, ttft_s, rate_s, e2e);
 
+    if (!to_history) return;
     std::function<void(json)> sink;
     {
         std::lock_guard<std::mutex> lk(record_m_);
         sink = record_sink_;
     }
-    if (sink) sink(request_record(r, t, overall, n_gen, e2e));
+    if (sink) {
+        try {
+            sink(request_record(r, t, overall, n_gen, e2e));
+        } catch (...) {}
+    }
+}
+
+/* (local) Truncate `s` to at most `max_bytes` strictly on a UTF-8 codepoint boundary, replacing
+ * malformed bytes with U+FFFD so JSON serialization can never throw type_error.316. */
+static std::string utf8_truncate(std::string_view s, size_t max_bytes) {
+    /* Include 3 bytes of slack so a valid multibyte codepoint starting before max_bytes stays
+     * intact during sanitization and is cleanly dropped by utf8_valid_prefix rather than turned
+     * into U+FFFD. */
+    std::string clean = utf8_sanitize(s.substr(0, std::min(s.size(), max_bytes + 3)));
+    if (clean.size() > max_bytes)
+        clean.resize(utf8_valid_prefix(std::string_view(clean.data(), max_bytes)));
+    return clean;
+}
+
+static std::string format_record_src(const std::string& forwarded_for, const std::string& peer) {
+    auto host_of = [](std::string p) {
+        if (!p.empty() && p[0] == '[')
+            return p.substr(1, p.find(']') == std::string::npos ? std::string::npos : p.find(']') - 1);
+        const size_t c = p.rfind(':');
+        return c != std::string::npos && p.find(':') == c ? p.substr(0, c) : p;
+    };
+    if (!forwarded_for.empty()) {
+        std::string f = forwarded_for.substr(0, forwarded_for.find(','));
+        while (!f.empty() && f.front() == ' ') f.erase(0, 1);
+        return "xff:" + utf8_sanitize(f);
+    }
+    return peer.empty() ? std::string("in-process") : "ip:" + utf8_sanitize(host_of(peer));
+}
+
+HttpMeta Server::copy_http_meta(const HttpRequest& req) {
+    HttpMeta m;
+    m.peer = utf8_sanitize(req.peer);
+    m.path = utf8_sanitize(req.path);
+    auto header = [&](const char* k, size_t cap) {
+        auto h = req.headers.find(k);
+        return h == req.headers.end() ? std::string() : utf8_truncate(h->second, cap);
+    };
+    m.tag = header("X-Request-Tag", 23);
+    m.user_agent = header("User-Agent", 200);
+    m.forwarded_for = header("X-Forwarded-For", 200);
+    m.session_header = header("X-Session-ID", 200);
+    if (m.session_header.empty()) m.session_header = header("X-Litellm-Session-Id", 200);
+    return m;
+}
+
+void Server::copy_http_meta(const HttpRequest& req, OaiRequest& r) {
+    HttpMeta m = copy_http_meta(req);
+    r.peer = std::move(m.peer);
+    r.path = std::move(m.path);
+    r.tag = std::move(m.tag);
+    r.user_agent = std::move(m.user_agent);
+    r.forwarded_for = std::move(m.forwarded_for);
+    r.session_header = std::move(m.session_header);
 }
 
 /* (local) The dashboard's record of one finished request: what llama-swap stored of it, from the
@@ -1117,32 +1175,22 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
 json Server::request_record(const OaiRequest& r, const TimingsOut& t, Finish overall, int64_t n_gen,
                             double e2e) {
     auto rate = [](int64_t n, double ms) { return n > 0 && ms > 0.0 ? (double)n * 1000.0 / ms : 0.0; };
-    auto host_of = [](std::string p) {
-        if (!p.empty() && p[0] == '[') return p.substr(1, p.find(']') == std::string::npos ? std::string::npos : p.find(']') - 1);
-        const size_t c = p.rfind(':');
-        return c != std::string::npos && p.find(':') == c ? p.substr(0, c) : p;
-    };
     const int64_t t1 = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch()).count();
     const double total_ms = t.valid && t.total_ms >= 0.0 ? t.total_ms : e2e * 1000.0;
     json o;
     o["t0"] = t1 - (int64_t)std::llround(total_ms);
     o["t1"] = t1;
-    o["rid"] = r.id;
-    o["model"] = r.model;
-    o["path"] = r.path;
+    o["rid"] = utf8_sanitize(r.id);
+    o["model"] = utf8_sanitize(r.model);
+    o["kind"] = "chat";
+    o["path"] = utf8_sanitize(r.path);
     o["sse"] = r.stream;
     o["code"] = overall == Finish::Error ? 500 : 200;
     o["err"] = overall == Finish::Error ? "the engine failed the request"
              : overall == Finish::Cancelled ? "client disconnected" : "";
-    if (!r.forwarded_for.empty()) {
-        std::string f = r.forwarded_for.substr(0, r.forwarded_for.find(','));
-        while (!f.empty() && f.front() == ' ') f.erase(0, 1);
-        o["src"] = "xff:" + f;
-    } else {
-        o["src"] = r.peer.empty() ? std::string("in-process") : "ip:" + host_of(r.peer);
-    }
-    o["ua"] = r.user_agent;
+    o["src"] = format_record_src(r.forwarded_for, r.peer);
+    o["ua"] = utf8_sanitize(r.user_agent);
     o["cache"] = t.valid ? t.cache_n : 0;
     o["in"] = t.valid ? t.prompt_n : 0;
     o["out"] = t.valid ? t.predicted_n : n_gen;
@@ -1155,10 +1203,61 @@ json Server::request_record(const OaiRequest& r, const TimingsOut& t, Finish ove
     o["pps"] = t.valid ? rate(t.prompt_n, t.prompt_ms) : 0.0;
     o["tps"] = t.valid ? rate(t.decode_n, t.predicted_ms) : 0.0;
     o["ttft"] = t.valid && t.ttft_ms >= 0.0 ? json(t.ttft_ms) : json(nullptr);
-    o["ses"] = !r.session_header.empty() ? r.session_header : r.session_label;
+    o["audio_s"] = 0.0;
+    o["ses"] = utf8_sanitize(!r.session_header.empty() ? r.session_header : r.session_label);
     o["pri"] = r.priority;
-    o["tag"] = r.tag;
+    o["tag"] = utf8_sanitize(r.tag);
     return o;
+}
+
+void Server::emit_record(json rec) {
+    std::function<void(json)> sink;
+    {
+        std::lock_guard<std::mutex> lk(record_m_);
+        sink = record_sink_;
+    }
+    if (!sink) return;
+    try {
+        sink(std::move(rec));
+    } catch (...) {}
+}
+
+void Server::emit_job_record(const HttpMeta& meta, const std::string& model, const std::string& kind,
+                             const std::string& rid, bool sse, int code, const std::string& err,
+                             double total_ms, double audio_s, int64_t in_tok, int64_t out_tok,
+                             int64_t cache_tok, double pms, double dms, double pps, double tps) {
+    const double ms = (std::isfinite(total_ms) && total_ms >= 0.0) ? total_ms : 0.0;
+    const int64_t t1 = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch()).count();
+    json o;
+    o["t0"] = t1 - (int64_t)std::llround(ms);
+    o["t1"] = t1;
+    o["rid"] = utf8_sanitize(rid);
+    o["model"] = utf8_sanitize(model.empty() ? opt_.model_id : model);
+    o["kind"] = utf8_sanitize(kind);
+    o["path"] = utf8_sanitize(meta.path);
+    o["sse"] = sse;
+    o["code"] = code;
+    o["err"] = utf8_sanitize(err);
+    o["src"] = format_record_src(meta.forwarded_for, meta.peer);
+    o["ua"] = utf8_sanitize(meta.user_agent);
+    o["cache"] = cache_tok;
+    o["in"] = in_tok;
+    o["out"] = out_tok;
+    o["dn"] = (int64_t)0;
+    o["da"] = (int64_t)0;
+    o["pms"] = pms;
+    o["dms"] = dms;
+    o["prms"] = 0.0;
+    o["ms"] = ms;
+    o["pps"] = pps;
+    o["tps"] = tps;
+    o["ttft"] = nullptr;
+    o["audio_s"] = audio_s;
+    o["ses"] = utf8_sanitize(meta.session_header);
+    o["pri"] = 0;
+    o["tag"] = utf8_sanitize(meta.tag);
+    emit_record(std::move(o));
 }
 
 void Server::set_record_sink(std::function<void(json)> f) {
@@ -1746,18 +1845,7 @@ HttpResponse Server::handle_messages(const HttpRequest& req) {
 }
 
 HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
-    r.peer = req.peer;
-    if (auto t = req.headers.find("X-Request-Tag"); t != req.headers.end())
-        r.tag = t->second.substr(0, 23);
-    r.path = req.path;
-    auto header = [&](const char* k) {
-        auto h = req.headers.find(k);
-        return h == req.headers.end() ? std::string() : h->second.substr(0, 200);
-    };
-    r.user_agent = header("User-Agent");
-    r.forwarded_for = header("X-Forwarded-For");
-    r.session_header = header("X-Session-ID");
-    if (r.session_header.empty()) r.session_header = header("X-Litellm-Session-Id");
+    copy_http_meta(req, r);
     if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
         return *no;
     log_admitted(r);

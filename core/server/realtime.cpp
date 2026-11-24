@@ -119,7 +119,7 @@ ojson event(const char* type) {
 }  /* namespace */
 
 /* One turn: its audio at the model's rate, and what of its transcript has gone out. */
-struct RtTurn {
+struct Server::RtTurn {
     std::string id;
     std::vector<float> audio;
     int64_t start_ms = 0;               /* on the session's clock */
@@ -132,11 +132,18 @@ struct RtTurn {
     size_t  heard = 0;                  /* audio.size() when its last pass began */
     int64_t n_prompt = 0, n_gen = 0;
     int     passes = 0;
+    /* (local) One History record per turn, accumulated across all passes of the turn. */
+    int64_t t_start_ns = 0;
+    bool    recorded = false;
+    int64_t n_decode = 0;
+    double  pms = 0.0, dms = 0.0;
+    bool    has_pms = false, has_timings = false;
 };
 
 struct Server::RealtimeSession {
     std::string id;
     std::string peer;
+    HttpMeta    meta;
 
     /* The connection's thread to the session's: messages, and whether the peer is gone. */
     std::mutex m;
@@ -251,6 +258,7 @@ void Server::handle_realtime(const HttpRequest& req, WsConn& ws) {
 
     RealtimeSession s;
     s.id = random_id("sess_");
+    s.meta = copy_http_meta(req);
     s.peer = req.peer;
     s.model = opt_.model_id;
     s.model_rate = deps_.mm->audio_rate();
@@ -286,6 +294,28 @@ void Server::handle_realtime(const HttpRequest& req, WsConn& ws) {
 
 /* ------------------------------------------------------------------ the session's thread */
 
+void Server::emit_rt_turn(const RealtimeSession& s, RtTurn& t, Finish fin,
+                          const std::string& err_override) {
+    if (t.recorded || t.passes == 0) return;
+    t.recorded = true;
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now().time_since_epoch()).count();
+    const double total_ms = t.t_start_ns > 0
+        ? std::max(0.0, (double)(now_ns - t.t_start_ns) * 1e-6) : 0.0;
+    const double audio_s = s.model_rate > 0 ? (double)t.audio.size() / (double)s.model_rate : 0.0;
+    const int code = fin == Finish::Error ? 500 : 200;
+    const std::string err = !err_override.empty() ? err_override
+                          : fin == Finish::Error ? "the engine failed the request"
+                          : fin == Finish::Cancelled ? "client disconnected" : "";
+    const double pms = t.has_pms ? t.pms : -1.0;
+    const double dms = t.has_timings ? t.dms : -1.0;
+    const double pps = (t.n_prompt > 0 && pms > 0.0) ? (double)t.n_prompt * 1000.0 / pms : 0.0;
+    const double tps = (t.n_decode > 0 && dms > 0.0) ? (double)t.n_decode * 1000.0 / dms : 0.0;
+    emit_job_record(s.meta, s.model, "asr", t.id, /*sse=*/true, code, err,
+                    total_ms, audio_s, t.n_prompt, t.n_gen, /*cache_tok=*/0,
+                    pms, dms, pps, tps);
+}
+
 void Server::realtime_run(RealtimeSession& s, WsConn& ws) {
     bool server_closed = true;
     try {
@@ -307,10 +337,28 @@ void Server::realtime_run(RealtimeSession& s, WsConn& ws) {
     }
     if (s.pass.running) {
         cancel_all(s.pass.gens, !server_closed);
-        record(s.pass.r, s.pass.gens, Finish::Cancelled, /*quiet=*/true);
+        record(s.pass.r, s.pass.gens, Finish::Cancelled, /*quiet=*/true, /*to_history=*/false);
+        if (s.pass.turn) {
+            if (!s.pass.r.prompts.empty())
+                s.pass.turn->n_prompt += (int64_t)s.pass.r.prompts[0].tokens.size();
+            if (!s.pass.gens.empty()) {
+                s.pass.turn->n_gen += s.pass.gens[0].sink->n_produced();
+                const TimingsOut wt = timings_of(s.pass.gens, -1);
+                if (wt.valid) {
+                    s.pass.turn->has_timings = true;
+                    s.pass.turn->dms += wt.predicted_ms;
+                    s.pass.turn->n_decode += wt.decode_n;
+                    if (wt.prompt_ms >= 0.0) { s.pass.turn->has_pms = true; s.pass.turn->pms += wt.prompt_ms; }
+                }
+            }
+            emit_rt_turn(s, *s.pass.turn, Finish::Cancelled);
+        }
         retire(s.pass.gens);
         s.pass.running = false;
+        s.pass.turn.reset();
     }
+    if (s.open) emit_rt_turn(s, *s.open, Finish::Cancelled);
+    for (const auto& t : s.turns) emit_rt_turn(s, *t, Finish::Cancelled);
     RAD_INFO("realtime %s closed: %lld turns, %.1fs of audio", s.id.c_str(),
              (long long)s.n_turns, (double)s.clock / s.model_rate);
 }
@@ -701,7 +749,10 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
             return;
         }
         if (type == "input_audio_buffer.clear") {
-            if (s.open) s.open->dropped = true;
+            if (s.open) {
+                s.open->dropped = true;
+                emit_rt_turn(s, *s.open, Finish::Cancelled);
+            }
             s.open.reset();
             s.frame.clear();
             s.recent.clear();
@@ -755,6 +806,7 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
         o["error"] = std::move(e);
         send(o);
         RAD_WARN("realtime %s %s failed: %s", s.id.c_str(), t.id.c_str(), why.c_str());
+        emit_rt_turn(s, t, Finish::Error, why);
     };
     auto drop_front = [&](const std::shared_ptr<RtTurn>& t) {
         if (!s.turns.empty() && s.turns.front() == t) s.turns.pop_front();
@@ -831,6 +883,9 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
             }
             return;
         }
+        if (t->passes == 0)
+            t->t_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                Clock::now().time_since_epoch()).count();
         s.pass.turn = t;
         s.pass.final = final;
         s.pass.heard = n;
@@ -846,15 +901,27 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
         const std::string why = fin == Finish::Error ? engine_failure(*g.sink) : std::string();
         t->n_prompt += (int64_t)s.pass.r.prompts[0].tokens.size();
         t->n_gen += g.sink->n_produced();
+        {
+            const TimingsOut wt = timings_of(s.pass.gens, -1);
+            if (wt.valid) {
+                t->has_timings = true;
+                t->dms += wt.predicted_ms;
+                t->n_decode += wt.decode_n;
+                if (wt.prompt_ms >= 0.0) { t->has_pms = true; t->pms += wt.prompt_ms; }
+            }
+        }
         std::vector<int32_t> ids = t->settled;
         ids.insert(ids.end(), g.tokens.begin(), g.tokens.end());
         /* The end of the turn, which the decoder renders as nothing, is no part of the reply. */
         while (!ids.empty() && deps_.tok->reply_bytes(ids.back()).empty()) ids.pop_back();
-        record(s.pass.r, s.pass.gens, fin, /*quiet=*/true);
+        record(s.pass.r, s.pass.gens, fin, /*quiet=*/true, /*to_history=*/false);
         retire(s.pass.gens);
         s.pass.running = false;
         s.pass.turn.reset();
-        if (t->dropped) return;
+        if (t->dropped) {
+            emit_rt_turn(s, *t, Finish::Cancelled);
+            return;
+        }
         const bool forced = !s.language.empty();
         if (fin == Finish::Error) {
             if (s.pass.final) {
@@ -879,6 +946,7 @@ bool Server::realtime_loop(RealtimeSession& s, WsConn& ws) {
                      (double)t->audio.size() / s.model_rate, t->passes, (long long)t->n_prompt,
                      (long long)t->n_gen,
                      std::chrono::duration<double>(Clock::now() - t->committed_at).count());
+            emit_rt_turn(s, *t, Finish::Stop);
             drop_front(t);
             return;
         }

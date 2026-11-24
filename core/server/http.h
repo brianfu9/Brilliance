@@ -116,6 +116,17 @@ void warn_if_keyless_network_listener(const std::string& bound_addr, bool has_ap
 std::string attributed_client(const std::string& raw_addr, const std::string& xff,
                               const std::vector<std::string>& trusted);
 
+/* (local) Outcome of a non-scheduler generation job (images, audio, shapes), filled by the handler
+ * once the job is admitted to its driver so Server::run_job records admitted jobs accurately (both
+ * buffered and streamed, including mid-stream errors). */
+struct JobOutcome {
+    bool        admitted = false;
+    int         code = 200;
+    std::string err;
+    std::string rid;
+    std::string meta;
+};
+
 struct HttpResponse {
     int         status = 200;
     std::string content_type = "application/json; charset=utf-8";
@@ -129,6 +140,9 @@ struct HttpResponse {
     /* Runs exactly once when the connection ends; `ok` is false if the peer left before the
      * stream finished. A dropped stream becomes a scheduler cancellation here. */
     std::function<void(bool ok)> on_close;
+
+    /* (local) Present when a run_job handler tracks admission and final status for History. */
+    std::shared_ptr<JobOutcome> job_outcome;
 
     bool streaming() const { return next != nullptr; }
 

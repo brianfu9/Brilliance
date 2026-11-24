@@ -329,9 +329,17 @@ public:
      * handed in rather than taken inside it. */
     void note_ready(uint64_t begin_ns);
 
-    /* (local) Called with each finished text request's record (request_record) when set; the
-     * fleet passes it to the dashboard's history (History::request_done). Thread-safe. */
+    /* (local) Called with each finished request's record when set; the fleet passes it to the
+     * dashboard's history (History::request_done). Thread-safe. */
     void set_record_sink(std::function<void(json)> f);
+    static HttpMeta copy_http_meta(const HttpRequest& req);
+    static void     copy_http_meta(const HttpRequest& req, OaiRequest& r);
+    void emit_record(json rec);
+    void emit_job_record(const HttpMeta& meta, const std::string& model, const std::string& kind,
+                         const std::string& rid, bool sse, int code, const std::string& err,
+                         double total_ms, double audio_s = 0.0, int64_t in_tok = 0,
+                         int64_t out_tok = 0, int64_t cache_tok = 0, double pms = -1.0,
+                         double dms = -1.0, double pps = 0.0, double tps = 0.0);
 
 private:
     json request_record(const OaiRequest& r, const TimingsOut& t, Finish overall, int64_t n_gen, double e2e);
@@ -340,6 +348,7 @@ private:
     std::string template_default_effort_;
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
+    struct RtTurn;             /* realtime.cpp */
     struct RealtimeSession;    /* realtime.cpp */
     struct SpeechSession;      /* speech_stream.cpp */
     struct VideoJob;           /* videos.cpp */
@@ -386,6 +395,8 @@ private:
      * server ended the session, false when the peer left. */
     void realtime_run(RealtimeSession& s, WsConn& ws);
     bool realtime_loop(RealtimeSession& s, WsConn& ws);
+    void emit_rt_turn(const RealtimeSession& s, RtTurn& t, Finish fin,
+                      const std::string& err_override = std::string());
     HttpResponse handle_models(const HttpRequest& req);
     HttpResponse handle_loras(const HttpRequest& req);
     HttpResponse handle_metrics(const HttpRequest& req);
@@ -405,7 +416,8 @@ private:
     int speech_request(const json& body, const std::string& text,
                        std::unique_ptr<gen::AudioRequest>* out, ApiError* err);
     HttpResponse stream_speech(std::shared_ptr<gen::AudioTicket> ticket, const AudioGenInfo& info,
-                               int64_t n_tok, uint64_t seed, bool sse, bool wav);
+                               int64_t n_tok, uint64_t seed, bool sse, bool wav,
+                               std::shared_ptr<JobOutcome> outcome = nullptr);
 
     /* ------------------------------------------------------------------ videos.cpp
      * OpenAI's video jobs: created by POST, made in the background, polled and downloaded. */
@@ -519,9 +531,10 @@ private:
     HttpResponse streaming_completion(const HttpRequest& req, OaiRequest& r);
 
     /* `quiet` says the request's line at the debug level: one of the many small passes a
-     * realtime session makes, which its own lines account for. */
+     * realtime session makes, which its own lines account for. `to_history` false keeps
+     * Prometheus metrics updated without emitting duplicate per-wave/per-pass History records. */
     void  record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall,
-                 bool quiet = false);
+                 bool quiet = false, bool to_history = true);
 
     Deps           deps_;
     ServerOptions  opt_;

@@ -2114,6 +2114,8 @@ TEST(a_finished_request_hands_its_record_to_the_sink) {
     const json& g = got[0];
     CHECK_EQ(g["rid"].get<std::string>(), j["id"].get<std::string>());
     CHECK_EQ(g["model"].get<std::string>(), "rad");
+    CHECK_EQ(g["kind"].get<std::string>(), "chat");
+    CHECK_NEAR(g["audio_s"].get<double>(), 0.0, 1e-12);
     CHECK_EQ(g["path"].get<std::string>(), "/v1/chat/completions");
     CHECK_EQ(g["code"].get<int64_t>(), (int64_t)200);
     CHECK_EQ(g["err"].get<std::string>(), "");
@@ -2140,6 +2142,95 @@ TEST(a_finished_request_hands_its_record_to_the_sink) {
     REQUIRE_EQ((int)got.size(), 2);
     CHECK_EQ(got[1]["ses"].get<std::string>(), "conv-7");
     CHECK_EQ(got[1]["src"].get<std::string>(), "xff:10.0.0.9");
+}
+
+/* (local) UTF-8 multibyte headers truncated at 200 / 23 bytes stay valid UTF-8 and never throw
+ * in dump(), and an exception thrown by record_sink_ is swallowed without breaking the response. */
+TEST(record_sink_truncates_utf8_headers_safely_and_swallows_sink_exceptions) {
+    Fixture f;
+    std::vector<json> got;
+    f.srv->set_record_sink([&](json r) { got.push_back(std::move(r)); });
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/chat/completions";
+    q.body = R"({"model":"rad","messages":[{"role":"user","content":"hi"}]})";
+    q.peer = "10.0.0.1:1234";
+    /* 199 ASCII bytes + 4-byte emoji straddling byte 200; 22 ASCII bytes + 3-byte CJK straddling
+     * byte 23; invalid raw bytes inside session header. */
+    q.headers["User-Agent"] = std::string(199, 'a') + "\xF0\x9F\x98\x80" + "tail";
+    q.headers["X-Request-Tag"] = std::string(22, 'x') + "\xE4\xB8\xAD" + "!";
+    q.headers["X-Session-ID"] = std::string("ses-\xFF\xFE-end");
+    q.headers["X-Forwarded-For"] = std::string(199, '1') + "\xC3\xA9";
+    HttpResponse r = f.srv->router().dispatch(q);
+    CHECK_EQ(r.status, 200);
+    REQUIRE_EQ((int)got.size(), 1);
+    const json& g = got[0];
+    CHECK_EQ(g["ua"].get<std::string>(), std::string(199, 'a'));
+    CHECK(g["ua"].get<std::string>().size() <= 200u);
+    CHECK_EQ(g["tag"].get<std::string>(), std::string(22, 'x'));
+    CHECK(g["tag"].get<std::string>().size() <= 23u);
+    CHECK_EQ(g["src"].get<std::string>(), "xff:" + std::string(199, '1'));
+    CHECK(has(g["ses"].get<std::string>(), "\xEF\xBF\xBD"));
+    CHECK(!g.dump().empty());
+
+    /* A throwing sink must never propagate out of Server::record() or terminate the server. */
+    f.srv->set_record_sink([](json) { throw std::runtime_error("sink boom"); });
+    HttpResponse r2 = f.srv->router().dispatch(q);
+    CHECK_EQ(r2.status, 200);
+}
+
+/* (local) emit_job_record emits the full record shape (including kind and audio_s), and
+ * pre-admission failures in run_job (e.g. 501) emit no History record. */
+TEST(emit_job_record_populates_all_fields_and_run_job_skips_unadmitted) {
+    Fixture f;
+    std::vector<json> got;
+    f.srv->set_record_sink([&](json r) { got.push_back(std::move(r)); });
+
+    HttpMeta meta;
+    meta.peer = "10.0.0.2:9999";
+    meta.path = "/v1/images/generations";
+    meta.user_agent = "img-client/1";
+    meta.forwarded_for = "198.51.100.7, 127.0.0.1";
+    meta.session_header = "ses_img";
+    meta.tag = "1024x1024 8st";
+    f.srv->emit_job_record(meta, "qwen-image", "image", "img_42", /*sse=*/true, 200, "",
+                           123.5, /*audio_s=*/2.25, /*in_tok=*/10, /*out_tok=*/20,
+                           /*cache_tok=*/4, /*pms=*/15.0, /*dms=*/50.0, /*pps=*/666.0,
+                           /*tps=*/400.0);
+    REQUIRE_EQ((int)got.size(), 1);
+    const json& g = got[0];
+    CHECK_EQ(g["rid"].get<std::string>(), "img_42");
+    CHECK_EQ(g["model"].get<std::string>(), "qwen-image");
+    CHECK_EQ(g["kind"].get<std::string>(), "image");
+    CHECK_EQ(g["path"].get<std::string>(), "/v1/images/generations");
+    CHECK_EQ(g["sse"].get<bool>(), true);
+    CHECK_EQ(g["code"].get<int64_t>(), (int64_t)200);
+    CHECK_EQ(g["err"].get<std::string>(), "");
+    CHECK_EQ(g["src"].get<std::string>(), "xff:198.51.100.7");
+    CHECK_EQ(g["ua"].get<std::string>(), "img-client/1");
+    CHECK_EQ(g["ses"].get<std::string>(), "ses_img");
+    CHECK_EQ(g["tag"].get<std::string>(), "1024x1024 8st");
+    CHECK_EQ(g["in"].get<int64_t>(), (int64_t)10);
+    CHECK_EQ(g["out"].get<int64_t>(), (int64_t)20);
+    CHECK_EQ(g["cache"].get<int64_t>(), (int64_t)4);
+    CHECK_EQ(g["dn"].get<int64_t>(), (int64_t)0);
+    CHECK_EQ(g["da"].get<int64_t>(), (int64_t)0);
+    CHECK_NEAR(g["pms"].get<double>(), 15.0, 1e-9);
+    CHECK_NEAR(g["dms"].get<double>(), 50.0, 1e-9);
+    CHECK_NEAR(g["prms"].get<double>(), 0.0, 1e-9);
+    CHECK_NEAR(g["ms"].get<double>(), 123.5, 1e-9);
+    CHECK_NEAR(g["pps"].get<double>(), 666.0, 1e-9);
+    CHECK_NEAR(g["tps"].get<double>(), 400.0, 1e-9);
+    CHECK(g["ttft"].is_null());
+    CHECK_NEAR(g["audio_s"].get<double>(), 2.25, 1e-9);
+    CHECK_EQ(g["pri"].get<int64_t>(), (int64_t)0);
+    CHECK_EQ(g["t1"].get<int64_t>() - g["t0"].get<int64_t>(), (int64_t)124);
+    CHECK(!g.dump().empty());
+
+    /* Pre-admission 501 via run_job must not emit a History record. */
+    HttpResponse r = f.post("/v1/images/generations", R"({"prompt":"cat"})");
+    CHECK_EQ(r.status, 501);
+    CHECK_EQ((int)got.size(), 1);
 }
 
 TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
@@ -6425,6 +6516,49 @@ TEST(a_streamed_transcription_sends_the_transcript_and_ends_with_done) {
     CHECK_EQ(done, std::string("hello"));
     CHECK(!has(all, "lang "));
 }
+
+/* (local) Multi-wave transcription keeps per-wave Prometheus metrics (Server::record with
+ * to_history=false) while emitting exactly one ASR History record carrying audio_s and HTTP meta. */
+TEST(transcription_emits_one_asr_record_per_request_while_keeping_per_wave_metrics) {
+    SpeechRig r(/*transcribes=*/true, /*queue_depth=*/2);
+    r.audio.max_clip = 1600;
+    r.sched.reply = "lang English<t> ok";
+    std::vector<json> got;
+    r.srv->set_record_sink([&](json rec) { got.push_back(std::move(rec)); });
+
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/audio/transcriptions";
+    q.peer = "100.64.0.9:4321";
+    q.headers["User-Agent"] = "whisper-cli/1";
+    q.headers["X-Session-ID"] = "asr-ses";
+    q.form = { audio_file(tone(4800)), field("model", "qwen3-asr") };
+    HttpResponse res = r.srv->router().dispatch(std::move(q));
+    CHECK_EQ(res.status, 200);
+
+    /* 4800 samples at 16 kHz / 1600 max_clip = 3 clips -> 2 waves at queue_depth=2,
+     * yet only 1 History record is emitted. */
+    REQUIRE_EQ((int)got.size(), 1);
+    const json& g = got[0];
+    CHECK_EQ(g["kind"].get<std::string>(), "asr");
+    CHECK_EQ(g["model"].get<std::string>(), "qwen3-asr");
+    CHECK_EQ(g["path"].get<std::string>(), "/v1/audio/transcriptions");
+    CHECK_EQ(g["sse"].get<bool>(), false);
+    CHECK_EQ(g["code"].get<int64_t>(), (int64_t)200);
+    CHECK_EQ(g["err"].get<std::string>(), "");
+    CHECK_EQ(g["src"].get<std::string>(), "ip:100.64.0.9");
+    CHECK_EQ(g["ua"].get<std::string>(), "whisper-cli/1");
+    CHECK_EQ(g["ses"].get<std::string>(), "asr-ses");
+    CHECK_NEAR(g["audio_s"].get<double>(), 0.3, 1e-6);
+    CHECK(g["in"].get<int64_t>() > 0);
+    CHECK(g["out"].get<int64_t>() > 0);
+    CHECK(!g.dump().empty());
+
+    /* Prometheus still observed both waves via Server::record(..., to_history=false). */
+    const HttpResponse m = r.srv->router().call("GET", "/metrics");
+    CHECK_EQ(m.status, 200);
+    CHECK(has(m.body, "vllm:request_success_total{model_name=\"asr-model\",engine=\"0\",finished_reason=\"stop\"} 2"));
+}
  
 /* ================================================================== speech: /v1/realtime */
 
@@ -6854,6 +6988,46 @@ TEST(a_fault_in_a_realtime_session_ends_the_session_not_the_server) {
     r.route.join();
     CHECK_EQ(r.rig.srv->in_flight(), (int64_t)0);
     CHECK_EQ(r.rig.srv->router().call("GET", "/health").status, 200);
+}
+
+/* (local) Realtime ASR emits one History record per completed turn (not one per interim pass),
+ * with cumulative token counts and audio_s. */
+TEST(realtime_asr_emits_one_record_per_completed_turn) {
+    RealtimeRig r;
+    std::mutex mu;
+    std::vector<json> got;
+    r.rig.srv->set_record_sink([&](json rec) {
+        std::lock_guard<std::mutex> lk(mu);
+        got.push_back(std::move(rec));
+    });
+    REQUIRE(!r.conn.wait_for("session.created").is_null());
+    r.conn.client(session_update(16000));
+    REQUIRE(!r.conn.wait_for("session.updated").is_null());
+
+    int64_t phase = 0;
+    r.speak(16000, 1500, true, &phase);
+    json commit;
+    commit["type"] = "input_audio_buffer.commit";
+    r.conn.client(commit);
+    json done = r.conn.wait_for("conversation.item.input_audio_transcription.completed");
+    REQUIRE(!done.is_null());
+    const std::string item = done["item_id"].get<std::string>();
+    r.conn.hangup();
+    r.route.join();
+
+    std::lock_guard<std::mutex> lk(mu);
+    REQUIRE_EQ((int)got.size(), 1);
+    const json& g = got[0];
+    CHECK_EQ(g["kind"].get<std::string>(), "asr");
+    CHECK_EQ(g["rid"].get<std::string>(), item);
+    CHECK_EQ(g["path"].get<std::string>(), "/v1/realtime");
+    CHECK_EQ(g["sse"].get<bool>(), true);
+    CHECK_EQ(g["code"].get<int64_t>(), (int64_t)200);
+    CHECK_EQ(g["err"].get<std::string>(), "");
+    CHECK(g["audio_s"].get<double>() > 1.0);
+    CHECK_EQ(g["in"].get<int64_t>(), done["usage"]["input_tokens"].get<int64_t>());
+    CHECK_EQ(g["out"].get<int64_t>(), done["usage"]["output_tokens"].get<int64_t>());
+    CHECK(!g.dump().empty());
 }
 
 namespace {

@@ -799,6 +799,17 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         }
     }
     admission.release(); // The response now owns the admission count.
+    auto outcome = std::make_shared<JobOutcome>();
+    outcome->admitted = true;
+    outcome->rid = random_id(edit ? "imgedit_" : "img_");
+    {
+        const int32_t eff_steps = r.steps > 0 ? r.steps
+                                              : (info.fixed_schedule ? info.fixed_steps
+                                                                     : info.default_steps);
+        outcome->meta = std::to_string(r.w) + "x" + std::to_string(r.h);
+        if (eff_steps > 0) outcome->meta += " " + std::to_string(eff_steps) + "st";
+        if (r.n > 1) outcome->meta += " x" + std::to_string(r.n);
+    }
     std::string lora_s;
     for (const auto& [n, w] : loras) lora_s += (lora_s.empty() ? " loras=" : ",") + n + fmt(":%g", w);
     RAD_INFO("images: %s %dx%d n=%d steps=%d seed=%llu%s%s%s%s", edit ? "edit" : "generation", r.w,
@@ -868,12 +879,21 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                 ticket->cancel.store(true);
                 release(1);
                 metrics_.observe_http(499);
-                return HttpResponse::text(499, "client closed request\n");
+                outcome->code = 200;
+                outcome->err = "client disconnected";
+                HttpResponse res = HttpResponse::text(499, "client closed request\n");
+                res.job_outcome = outcome;
+                return res;
             }
             if (stopping_.load()) {
                 ticket->cancel.store(true);
                 release(1);
-                return error_response(err_overloaded("the server is shutting down"), req.peer);
+                ApiError e = err_overloaded("the server is shutting down");
+                outcome->code = e.status;
+                outcome->err = e.message;
+                HttpResponse res = error_response(e, req.peer);
+                res.job_outcome = outcome;
+                return res;
             }
         }
         release(1);
@@ -886,7 +906,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             e.status = client ? 400 : 500;
             e.type = client ? "invalid_request_error" : "server_error";
             e.message = ticket->why().empty() ? "the image generator failed" : ticket->why();
-            return error_response(e, req.peer);
+            outcome->code = e.status;
+            outcome->err = e.message;
+            HttpResponse res = error_response(e, req.peer);
+            res.job_outcome = outcome;
+            return res;
         }
         std::sort(done.begin(), done.end(),
                   [](const gen::Image& a, const gen::Image& b) { return a.index < b.index; });
@@ -900,7 +924,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
                 e.status = 500;
                 e.type = "server_error";
                 e.message = "the picture could not be encoded: " + why;
-                return error_response(e, req.peer);
+                outcome->code = e.status;
+                outcome->err = e.message;
+                HttpResponse res = error_response(e, req.peer);
+                res.job_outcome = outcome;
+                return res;
             }
             data.push_back(json{ { "b64_json", std::move(b64) }, { "revised_prompt", r.prompt },
                                  { "seed", im.seed } });
@@ -912,7 +940,9 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         out["size"] = size_s;
         out["usage"] = usage();
         metrics_.observe_http(200);
-        return HttpResponse::json_body(200, json_dump(out));
+        HttpResponse res = HttpResponse::json_body(200, json_dump(out));
+        res.job_outcome = outcome;
+        return res;
     }
 
     /* ---- streamed: partial images as previews arrive, one completed event per image */
@@ -920,12 +950,13 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
     res.status = 200;
     res.content_type = "text/event-stream";
     res.set_header("Cache-Control", "no-cache");
+    res.job_outcome = outcome;
     const std::string kind = edit ? "image_edit" : "image_generation";
     auto finished = std::make_shared<bool>(false);
     auto released = std::make_shared<bool>(false);
     const std::string quality = r.quality;
     res.next = [this, ticket, kind, encode, created, size_s, bg_out, fmt, quality, usage, finished,
-                released](std::string& chunk) mutable -> bool {
+                released, outcome](std::string& chunk) mutable -> bool {
         if (*finished) return false;
         gen::Image im;
         bool to = false;
@@ -933,8 +964,11 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             std::string b64, why;
             json ev;
             if (encode(im, &b64, &why) < 0) {
+                const std::string msg = "the picture could not be encoded: " + why;
                 ev["type"] = "error";
-                ev["error"] = json{ { "message", "the picture could not be encoded: " + why } };
+                ev["error"] = json{ { "message", msg } };
+                outcome->code = 500;
+                outcome->err = msg;
             } else {
                 ev["type"] = kind + (im.preview ? ".partial_image" : ".completed");
                 ev["b64_json"] = std::move(b64);
@@ -950,10 +984,22 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
             chunk = "event: " + ev["type"].get<std::string>() + "\ndata: " + json_dump(ev) + "\n\n";
             return true;
         }
-        if (to) { chunk.clear(); return !stopping_.load(); }
+        if (to) {
+            chunk.clear();
+            if (stopping_.load()) {
+                outcome->code = 503;
+                outcome->err = "the server is shutting down";
+                return false;
+            }
+            return true;
+        }
         *finished = true;
         if (!*released) { *released = true; release(1); }
         if (ticket->status() < 0) {
+            const int code = ticket->status() == RAD_E_INVAL ? 400 : 500;
+            const std::string msg = ticket->why().empty() ? "the image generator failed" : ticket->why();
+            outcome->code = code;
+            outcome->err = msg;
             json ev;
             ev["type"] = "error";
             ev["error"] = json{ { "message", ticket->why() },
@@ -965,8 +1011,14 @@ HttpResponse Server::handle_images(const HttpRequest& req, bool edit) {
         chunk.clear();
         return false;
     };
-    res.on_close = [this, ticket, released](bool ok) {
-        if (!ok) ticket->cancel.store(true);
+    res.on_close = [this, ticket, released, finished, outcome](bool ok) {
+        if (!ok) {
+            ticket->cancel.store(true);
+            if (!*finished && outcome->err.empty()) {
+                outcome->code = 200;
+                outcome->err = "client disconnected";
+            }
+        }
         if (!*released) { *released = true; release(1); }
     };
     metrics_.observe_http(200);

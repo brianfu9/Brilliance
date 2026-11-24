@@ -79,6 +79,9 @@ namespace server {
 
 struct Server::VideoJob {
     std::string id, model, prompt, seconds, size;
+    HttpMeta    meta;
+    int64_t     t_start_ns = 0;
+    std::string req_model;
     int64_t     created_at = 0;
     uint64_t    seed = 0;
     int32_t     sampler = 0;   /* the request's RAD_SAMPLER_* */
@@ -969,6 +972,13 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     auto j = std::make_shared<VideoJob>();
     j->id = new_video_id();
     j->model = opt_.model_id;
+    j->meta = copy_http_meta(req);
+    j->meta.path = "/v1/videos";
+    j->t_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    j->req_model = (has(body, "model") && body["model"].is_string() && !body["model"].get<std::string>().empty())
+                       ? body["model"].get<std::string>()
+                       : opt_.model_id;
     j->prompt = prompt;
     j->seconds = auto_len ? std::string("auto") : rad::fmt("%.2f", (double)frames / fps);
     j->size = std::to_string(W) + "x" + std::to_string(H);
@@ -1123,60 +1133,75 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         st = mp4.finish(&file, &why);
     release(1);
 
-    std::lock_guard<std::mutex> lk(videos_m_);
-    const int64_t now = unix_now();
-    if (st >= 0 && !aborted && t.status() >= 0 && frames == t.frames) {
-        j->status = "completed";
-        j->progress = 100;
-        j->completed_at = now;
-        j->expires_at = now + opt_.video_ttl_s;
-        j->mp4 = std::move(file);
-        if (!opt_.media_out.empty())
-            persist_media_file("videos", j->id + ".mp4", j->mp4.data(), j->mp4.size());
-        auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1e9; };
-        const std::string steps = t.t_upscaled_ns > 0
-            ? rad::fmt("small steps %.1f s, upscale %.2f s, full steps %.1f s",
-                       sec(t.t_cond_ns, t.t_small_ns), sec(t.t_small_ns, t.t_upscaled_ns),
-                       sec(t.t_upscaled_ns, t.t_denoised_ns))
-            : rad::fmt("steps %.1f s", sec(t.t_cond_ns, t.t_denoised_ns));
-        RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s: queue and prompt %.1f s, %s, "
-                 "decode %.1f s", j->id.c_str(), (double)j->mp4.size() / 1e6,
-                 mp4.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
-                 sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns));
-    } else {
-        j->status = "failed";
-        j->failed = true;
-        j->completed_at = now;
-        if (st < 0) {
-            j->err_code = "encoding_failed";
-            j->err_message = "the video could not be written: " + why;
-        } else if (aborted || t.status() == RAD_E_CANCELLED) {
-            j->err_code = "cancelled";
-            j->err_message = aborted ? "this model is stopping" : "the video was cancelled";
+    bool rec_failed = false;
+    std::string rec_err, rec_size;
+    {
+        std::lock_guard<std::mutex> lk(videos_m_);
+        const int64_t now = unix_now();
+        if (st >= 0 && !aborted && t.status() >= 0 && frames == t.frames) {
+            j->status = "completed";
+            j->progress = 100;
+            j->completed_at = now;
+            j->expires_at = now + opt_.video_ttl_s;
+            j->mp4 = std::move(file);
+            if (!opt_.media_out.empty())
+                persist_media_file("videos", j->id + ".mp4", j->mp4.data(), j->mp4.size());
+            auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1e9; };
+            const std::string steps = t.t_upscaled_ns > 0
+                ? rad::fmt("small steps %.1f s, upscale %.2f s, full steps %.1f s",
+                           sec(t.t_cond_ns, t.t_small_ns), sec(t.t_small_ns, t.t_upscaled_ns),
+                           sec(t.t_upscaled_ns, t.t_denoised_ns))
+                : rad::fmt("steps %.1f s", sec(t.t_cond_ns, t.t_denoised_ns));
+            RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s: queue and prompt %.1f s, %s, "
+                     "decode %.1f s", j->id.c_str(), (double)j->mp4.size() / 1e6,
+                     mp4.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
+                     sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns));
         } else {
-            j->err_code = t.status() == RAD_E_INVAL ? "invalid_request" : "generation_failed";
-            j->err_message = t.why().empty() ? std::string(rad_strerror(t.status())) : t.why();
+            j->status = "failed";
+            j->failed = true;
+            j->completed_at = now;
+            if (st < 0) {
+                j->err_code = "encoding_failed";
+                j->err_message = "the video could not be written: " + why;
+            } else if (aborted || t.status() == RAD_E_CANCELLED) {
+                j->err_code = "cancelled";
+                j->err_message = aborted ? "this model is stopping" : "the video was cancelled";
+            } else {
+                j->err_code = t.status() == RAD_E_INVAL ? "invalid_request" : "generation_failed";
+                j->err_message = t.why().empty() ? std::string(rad_strerror(t.status())) : t.why();
+            }
+            RAD_WARN("video %s: failed: %s", j->id.c_str(), j->err_message.c_str());
         }
-        RAD_WARN("video %s: failed: %s", j->id.c_str(), j->err_message.c_str());
+        rec_failed = j->failed;
+        rec_err = j->err_message;
+        rec_size = j->size;
+        j->worker_done = true;
+        /* A finished job no longer changes, so it can be read without this server, which may be gone
+         * by the time its client comes for it. */
+        if (deps_.front && !j->deleted.load())
+            deps_.front->keep_job(j->id, j->expires_at ? j->expires_at : now + opt_.video_ttl_s,
+                                  opt_.max_videos, [j](const HttpRequest& q) -> HttpResponse {
+                if (q.method == "DELETE") {
+                    j->deleted.store(true);
+                    return video_deleted(j->id);
+                }
+                if (q.path.size() > 8 && q.path.compare(q.path.size() - 8, 8, "/content") == 0) {
+                    HttpResponse res;
+                    ApiError e;
+                    if (video_content(*j, q, &res, &e)) return res;
+                    return HttpResponse::json_body(e.status, error_body(q.path, e.status, e.type.c_str(), e.message));
+                }
+                return HttpResponse::json_body(200, json_dump(video_json(*j)));
+            });
     }
-    j->worker_done = true;
-    /* A finished job no longer changes, so it can be read without this server, which may be gone
-     * by the time its client comes for it. */
-    if (deps_.front && !j->deleted.load())
-        deps_.front->keep_job(j->id, j->expires_at ? j->expires_at : now + opt_.video_ttl_s,
-                              opt_.max_videos, [j](const HttpRequest& q) -> HttpResponse {
-            if (q.method == "DELETE") {
-                j->deleted.store(true);
-                return video_deleted(j->id);
-            }
-            if (q.path.size() > 8 && q.path.compare(q.path.size() - 8, 8, "/content") == 0) {
-                HttpResponse res;
-                ApiError e;
-                if (video_content(*j, q, &res, &e)) return res;
-                return HttpResponse::json_body(e.status, error_body(q.path, e.status, e.type.c_str(), e.message));
-            }
-            return HttpResponse::json_body(200, json_dump(video_json(*j)));
-        });
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double total_ms = std::max(0.0, (double)(now_ns - j->t_start_ns) * 1e-6);
+    HttpMeta rec_meta = j->meta;
+    if (rec_meta.path.empty()) rec_meta.path = "/v1/videos";
+    if (rec_meta.tag.empty() && !rec_size.empty()) rec_meta.tag = rec_size;
+    emit_job_record(rec_meta, j->req_model, "video", j->id, /*sse=*/false,
+                    rec_failed ? 500 : 200, rec_err, total_ms);
 }
 
 void Server::sweep_videos_locked(int64_t now) {

@@ -3115,25 +3115,29 @@ void Fleet::add_routes() {
      * it neither brings a model back nor costs a running one anything. A model's history is as
      * open as its /stats, whose figures it repeats, and the fleet's as guarded as /admin/fleet:
      * a browser the fleet view is refused to still draws the server's own model from it. */
-    /* (local) Each finished text request's record (Server::record) goes to the history, kept across
-     * restarts in RADIANCE_HISTORY_DIR when it is set. `GET /history/requests?model=` answers every
-     * kept record of a model as columns, for the Requests tab; a model's records are as open as its
-     * /history. */
+    /* (local) Each finished request's record (Server::record / run_job / speech / videos) goes to
+     * the history, kept across restarts in RADIANCE_HISTORY_DIR when it is set. Both
+     * `GET /history/requests` and the `requests` tail of `GET /history?model=` enforce
+     * `operator_ok` consistently. */
     if (const char* d = std::getenv("RADIANCE_HISTORY_DIR"); d && *d) history_.set_dir(d);
     front_.set_record_sink([this](const std::string& model, json rec) { history_.request_done(model, std::move(rec)); });
     front_.route("GET", "/history/requests", [this](const server::HttpRequest& q) {
-        auto it = q.query.find("model");
-        if (it == q.query.end() || it->second.empty())
-            return server::HttpResponse::json_body(400, "{\"error\":{\"message\":\"name the model: /history/requests?model=<id>\"}}");
-        return server::HttpResponse::json_body(200, history_.requests_body(it->second));
+        return server::handle_history_requests(history_, q, operator_ok(q));
     });
-    front_.route("GET", "/history", [this, guard, ok](const server::HttpRequest& q) {
+    front_.route("GET", "/history", [this, guard](const server::HttpRequest& q) {
         double since = 0;
         if (auto it = q.query.find("since"); it != q.query.end()) since = std::strtod(it->second.c_str(), nullptr);
         if (auto it = q.query.find("model"); it != q.query.end() && !it->second.empty())
-            return server::HttpResponse::json_body(200, history_.model_body(it->second, since));
+            return server::HttpResponse::json_body(200, history_.model_body(it->second, since, operator_ok(q)));
         if (auto g = guard(q)) return *g;
-        return server::HttpResponse::json_body(200, history_.fleet_body(since));
+        bool activity = false;
+        if (auto it = q.query.find("activity"); it != q.query.end() && it->second == "1") activity = true;
+        int64_t after_n = 0;
+        if (auto it = q.query.find("after_n"); it != q.query.end() && !it->second.empty())
+            after_n = std::strtoll(it->second.c_str(), nullptr, 10);
+        return server::HttpResponse::json_body(
+            200, activity ? history_.fleet_body(since, true, after_n, front_.names())
+                          : history_.fleet_body(since));
     });
     /* A command run by the scheduler thread, its answer awaited. */
     auto run_cmd = [this](std::function<std::string()> f, int64_t wait_ms) -> std::pair<bool, std::string> {

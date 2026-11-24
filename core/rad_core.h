@@ -1126,6 +1126,9 @@ struct Config {
     /* Seconds an unused conversation is kept in any tier (VRAM, host memory, its snapshots). 0
      * keeps everything until the memory is needed. */
     int64_t prefix_cache_ttl = 3600;
+    /* (local) Save-on-unload / load-on-bringup snapshot file for the host prefix cache and
+     * linear-state checkpoints. Empty is off. */
+    std::string prefix_cache_file;
 
     /* The cache always lends; there is no flag. It keeps the blocks in use plus a derived buffer
      * and lends the rest to the expert plane at addresses it already owns (core/mem/kv.h). The

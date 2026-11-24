@@ -26,6 +26,7 @@
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
+#include "mem/kvsnap.h"
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
@@ -556,6 +557,10 @@ private:
     bool                          quiet_done_ = false;
     void                          quiet_service();
     std::atomic<bool>             serving_{false};
+    bool                          ever_served_ = false;
+    KvSnapMeta                    kvsnap_meta_{};
+    void                          load_prefix_cache();
+    void                          save_prefix_cache();
     int  fail_loop(int st);
 
     /* This step's scored rows (Request::token_scores): a logits row and the result it fills.

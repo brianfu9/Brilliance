@@ -175,6 +175,8 @@ static const Flag g_flags[] = {
     { "--prefix-cache-ttl",   "S",      "seconds a cached conversation no request uses is kept, in VRAM\n"
     "                                    or host memory (default 3600). 0 keeps it until the memory\n"
     "                                    is wanted" },
+    { "--prefix-cache-file",  "PATH",   "save live host KV blocks and linear-state checkpoints to PATH\n"
+    "                                    on clean unload/shutdown and restore them on next load (local)" },
 
     { "--lora",               "ADAPTER", "NAME=PATH: serve a LoRA adapter beside the base model\n"
     "                                    (repeatable). A text model takes a PEFT directory and\n"
@@ -893,6 +895,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--plan-only"))             { c->plan_only = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
+        else if (S("--prefix-cache-file"))     { if (!(v = need(i))) return RAD_E_INVAL; c->prefix_cache_file = v; }
         else if (S("--lora")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             const char* eq = std::strchr(v, '=');
@@ -1863,6 +1866,7 @@ const ShowRow kShow[] = {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {
           return c.prefix_cache_ttl ? num(c.prefix_cache_ttl) + " s" : std::string("0 (never)"); } },
+    { "--prefix-cache-file",  [](const Config& c) { return or_none(c.prefix_cache_file, "off"); } },
     { "--lora",               [](const Config& c) {
           std::string o;
           for (const auto& [n, p] : c.lora.adapters) o += (o.empty() ? "" : ", ") + n + "=" + p;

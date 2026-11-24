@@ -338,6 +338,7 @@ A restart on the same port right after a stop binds normally.
 | Key | Level | Meaning | Default | Values | Who | Read at |
 |---|---|---|---|---|---|---|
 | `prefix-cache-mib` | a model (or `defaults:`) | copy finished conversations' KV to host memory, up to N MiB, so their VRAM can go to experts and a return restores instead of re-prefilling. A full tier drops its least recently used entries. 0 is off. Off while a KV group streams (kv-resident) **Safety:** pinned host memory, from the same budget as `host-pool-mib`. | 0 (off) | whole number | operator | `core/config.cpp:155` |
+| `prefix-cache-file` | a model (or `defaults:`) | save live host KV blocks and linear-state checkpoints to PATH on clean unload/shutdown and restore them on next load (local) | off | path | operator | `core/config.cpp:178` |
 | `prefix-cache-ttl` | a model (or `defaults:`) | seconds a cached conversation no request uses is kept, in VRAM or host memory (default 3600). 0 keeps it until the memory is wanted | 3600 | seconds | operator | `core/config.cpp:160` |
 | `no-prefix-cache` | a model (or `defaults:`) | disable prefix caching | false (prefix caching on) | true \| false (a switch) | operator | `core/config.cpp:234` |
 | `prefix-resume` | a model (or `defaults:`) | where a prefix hit resumes: exact (default) only where an idle server's cold prefill of the prompt starts a chunk, so the hit answers bit-identically to a cold run; nearest at the deepest snapshot, up to a chunk less to re-prefill | exact | a mode | operator | `core/config.cpp:235` |

@@ -292,10 +292,31 @@ public:
     void note_restore(int64_t ns) { std::lock_guard lk(mu_); ++stats_.restores; stats_.restore_ns += ns; }
     void note_flush(int64_t ns)   { std::lock_guard lk(mu_); ++stats_.flushes;  stats_.flush_ns += ns; }
     /* A copy taken under the lock; HTTP threads read it while the engine moves records. */
-    Stats        stats() const;
-    HostArena&   arena() { return arena_; }
+    Stats            stats() const;
+    HostArena&       arena() { return arena_; }
+    const HostArena& arena() const { return arena_; }
     /* Bytes per slot; under tensor parallelism one slot holds every rank's shard. */
-    int64_t      entry_bytes() const { return cfg_.entry_bytes; }
+    int64_t          entry_bytes() const { return cfg_.entry_bytes; }
+
+    /* ---------------- snapshot persistence (local, core/mem/kvsnap.h) ---------------- */
+    struct SnapHostRec {
+        BlockHash key;
+        int32_t   host_slot = -1;
+        int64_t   depth = 0;
+        uint64_t  used_ns = 0;
+    };
+    struct SnapSession {
+        uint64_t               id = 0;
+        int64_t                n_tokens = 0;
+        uint64_t               first_seen_ns = 0;
+        uint64_t               last_used_ns = 0;
+        std::string            label;
+        std::vector<BlockHash> chain;
+    };
+    void export_snap(std::vector<SnapHostRec>* host_recs, std::vector<SnapSession>* sessions) const;
+    int  import_host_rec(const BlockHash& key, int32_t host_slot, int64_t depth, uint64_t used_ns);
+    void import_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
+                        uint64_t first_seen_ns, uint64_t last_used_ns, const std::string& label);
 
 private:
     /* The host list's order, least valuable first: least recently used, and among entries used

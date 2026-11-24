@@ -25,6 +25,7 @@
 #include "format/table_share.h"
 #include "format/table_warm.h"
 #include "rad_plugin.h"
+#include "mem/kvsnap.h"
 #include "mem/vram_budget.h"
 #include "kvstream/bringup.h"
 #include "kvstream/plan.h"
@@ -5167,6 +5168,53 @@ int Engine::configure_kv() {
             ranks_[0]->prefix.set_tiers(&T);
             /* Logged whether the tiers are on or off. */
             RAD_INFO("%s", T.report().c_str());
+
+            /* (local) Save-on-unload / load-on-bringup KV prefix cache snapshot. */
+            if (!cfg_.prefix_cache_file.empty()) {
+                if (!T.host_on()) {
+                    RAD_WARN("kv snap: --prefix-cache-file %s ignored because the host tier "
+                             "(--prefix-cache-mib) is off", cfg_.prefix_cache_file.c_str());
+                } else {
+                    uint64_t fp = 1469598103934665603ull;
+                    kvsnap_hash_i64(&fp, (int64_t)kvsnap_hash_model(cfg_.model));
+                    kvsnap_hash_str(&fp, meta_.arch_id ? meta_.arch_id : "");
+                    kvsnap_hash_str(&fp, meta_.name ? meta_.name : "");
+                    kvsnap_hash_str(&fp, meta_.quant ? meta_.quant : "");
+                    kvsnap_hash_i64(&fp, meta_.n_layers);
+                    kvsnap_hash_str(&fp, cfg_.kv_cache_dtype);
+                    kvsnap_hash_i64(&fp, (int64_t)ranks_.size());
+                    char theta[32];
+                    std::snprintf(theta, sizeof theta, "%.9g", (double)meta_.rope_theta);
+                    kvsnap_hash_str(&fp, theta);
+                    kvsnap_hash_str(&fp, rope_identity(meta_kv_k_, meta_kv_v_));
+                    kvsnap_hash_i64(&fp, ranks_[0]->prefix.block_size());
+                    kvsnap_hash_i64(&fp, geo_.checkpoint_interval);
+                    kvsnap_hash_i64(&fp, slot_bytes);
+                    kvsnap_hash_i64(&fp, layout.rep_bytes);
+                    for (int64_t v : layout.own_off) kvsnap_hash_i64(&fp, v);
+                    for (int64_t v : layout.own_bytes) kvsnap_hash_i64(&fp, v);
+                    for (int32_t g : cg) {
+                        const KVGroupPlan* gp = ranks_[0]->kv.plan(g);
+                        kvsnap_hash_i64(&fp, g);
+                        if (gp) {
+                            kvsnap_hash_i64(&fp, gp->n_layers);
+                            kvsnap_hash_i64(&fp, gp->layer_bytes_per_block());
+                            kvsnap_hash_i64(&fp, gp->replicated ? 1 : 0);
+                        }
+                    }
+                    kvsnap_hash_i64(&fp, ck_slot_bytes);
+                    for (const auto& rk : ranks_)
+                        kvsnap_hash_i64(&fp, rk->kv.checkpoint_bytes());
+
+                    kvsnap_meta_.fingerprint         = fp;
+                    kvsnap_meta_.block_size          = ranks_[0]->prefix.block_size();
+                    kvsnap_meta_.entry_bytes         = slot_bytes;
+                    kvsnap_meta_.ckpt_bytes          = ck_slot_bytes;
+                    kvsnap_meta_.checkpoint_interval = geo_.checkpoint_interval;
+                    kvsnap_meta_.ttl_s               = cfg_.prefix_cache_ttl;
+                    load_prefix_cache();
+                }
+            }
         }
     }
 

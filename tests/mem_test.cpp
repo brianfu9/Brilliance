@@ -14,6 +14,7 @@
 #include "mem/prefix.h"
 #include "mem/vram_budget.h"
 #include "mem/kvtier.h"
+#include "mem/kvsnap.h"
 #include "device/device.h"
 #include "plugin/registry.h"
 #include "runtime/tierexec.h"
@@ -28,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -8385,6 +8387,247 @@ TEST(an_entry_with_a_streamed_group_is_never_demoted) {
     CHECK_EQ(f.kv.block_refcount(cg[0], 0), 0);
     CHECK_EQ(f.kv.block_refcount(cg[1], 0), 0);
     f.pc.set_tiers(nullptr);
+}
+
+TEST(kvsnap_round_trip_and_safety_guards) {
+    if (!host_backend_or_skip("kvsnap host arena")) return;
+    Fixture f1;
+    REQUIRE_EQ(f1.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    const int64_t entry_bytes = f1.kv.plan(G_FULL)->bytes_per_block;
+    const int64_t ckpt_bytes  = f1.kv.checkpoint_bytes();
+    REQUIRE(entry_bytes > 0);
+    REQUIRE(ckpt_bytes > 0);
+
+    IdleTiers t1;
+    IdleTiers::Config tc{};
+    tc.host_cap_bytes = entry_bytes * 16;
+    tc.entry_bytes    = entry_bytes;
+    tc.ckpt_bytes     = ckpt_bytes;
+    tc.ckpt_slots     = 4;
+    tc.block_tokens   = f1.pc.block_size();
+    REQUIRE_EQ(t1.configure(tc), RAD_OK);
+    f1.pc.set_tiers(&t1);
+
+    /* Publish 8 blocks (128 tokens) with two linear checkpoints at 64 and 128. */
+    const auto tokens = tok_run(9000, 128);
+    publish(f1, 1, tokens, 128);
+    const std::vector<BlockHash> hs = chain_of(tokens);
+    REQUIRE_EQ(hs.size(), 8u);
+    t1.note_session(1, hs, 128, rad_mono_ns(), "conv-alpha");
+
+    int32_t ck_slot_64 = -1, ck_slot_128 = -1;
+    REQUIRE_EQ(f1.pc.reserve_checkpoint(1, 64, hs[3], &ck_slot_64), RAD_OK);
+    std::memset(f1.ck.at(ck_slot_64), 0x5A, (size_t)ckpt_bytes);
+    f1.pc.commit_checkpoint(hs[3]);
+    REQUIRE_EQ(f1.pc.reserve_checkpoint(1, 128, hs[7], &ck_slot_128), RAD_OK);
+    std::memset(f1.ck.at(ck_slot_128), 0xA5, (size_t)ckpt_bytes);
+    f1.pc.commit_checkpoint(hs[7]);
+
+    /* Simulate writeback of all 8 blocks with distinct deterministic byte patterns. */
+    std::vector<TierJob> wb;
+    t1.plan_writeback(16, &wb);
+    REQUIRE_EQ(wb.size(), 8u);
+    std::unordered_map<BlockHash, uint8_t, BlockHashHash> pat;
+    for (size_t i = 0; i < wb.size(); ++i) {
+        const uint8_t fill = (uint8_t)(0x10 + i);
+        pat[wb[i].key] = fill;
+        std::memset(t1.arena().at(wb[i].host_slot), fill, (size_t)entry_bytes);
+        t1.report(wb[i], true);
+    }
+
+    KvSnapMeta meta{};
+    meta.fingerprint         = 0x123456789abcdef0ull;
+    meta.block_size          = f1.pc.block_size();
+    meta.entry_bytes         = entry_bytes;
+    meta.ckpt_bytes          = ckpt_bytes;
+    meta.checkpoint_interval = f1.pc.checkpoint_interval();
+    meta.ttl_s               = 3600;
+
+    const std::string snap_path =
+        (std::filesystem::temp_directory_path() /
+         fmt("rad_kvsnap_test_%lld.kvsnap", (long long)rad_mono_ns())).string();
+    KvSnapResult saved{};
+    REQUIRE_EQ(kvsnap_save(snap_path, meta, f1.pc, t1, &f1.ck, &saved), RAD_OK);
+    CHECK_EQ(saved.entries, 8ll);
+    CHECK_EQ(saved.ckpts, 2ll);
+    CHECK_EQ(saved.sessions, 1ll);
+
+    /* 1. Full round-trip into a brand-new engine state. */
+    {
+        Fixture f2;
+        REQUIRE_EQ(f2.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        IdleTiers t2;
+        REQUIRE_EQ(t2.configure(tc), RAD_OK);
+        f2.pc.set_tiers(&t2);
+
+        KvSnapResult loaded{};
+        REQUIRE_EQ(kvsnap_load(snap_path, meta, &f2.pc, &t2, &f2.ck, &loaded), RAD_OK);
+        CHECK_EQ(loaded.entries, 8ll);
+        CHECK_EQ(loaded.ckpts, 2ll);
+        CHECK_EQ(loaded.sessions, 1ll);
+        CHECK_EQ(f2.pc.resident(), 0ll);     /* zero VRAM consumed at startup */
+        CHECK_EQ(f2.pc.size(), 8ll);
+
+        auto probe = tokens;
+        probe.push_back(99999);              /* +1 token so lookup does not back off block 7 */
+        const auto rest = f2.pc.restorable_from(probe, {});
+        REQUIRE_EQ(rest.size(), 8u);
+
+        /* Verify host bytes & rebind into VRAM to confirm lookup + checkpoint hit. */
+        for (size_t i = 0; i < rest.size(); ++i) {
+            TierJob j;
+            REQUIRE(t2.plan_promote(rest[i], &j));
+            const uint8_t* p = static_cast<const uint8_t*>(t2.arena().at(j.host_slot));
+            REQUIRE(p != nullptr);
+            CHECK_EQ(p[0], pat[rest[i]]);
+            CHECK_EQ(p[entry_bytes - 1], pat[rest[i]]);
+            int32_t blk = -1;
+            REQUIRE_EQ(f2.kv.reserve_block(G_FULL, &blk), RAD_OK);
+            j.blocks = { blk };
+            j.started = true;
+            REQUIRE_EQ(f2.pc.rebind(rest[i], j.blocks), RAD_OK);
+            t2.report(j, true, rad_mono_ns());
+        }
+        const CacheHit hit = f2.pc.lookup(probe, {}, nullptr, nullptr, /*session=*/1);
+        CHECK_EQ(hit.n_attn_tokens, 128);
+        CHECK_EQ(hit.n_linear_tokens, 128);
+        REQUIRE(hit.checkpoint_slot >= 0);
+        const uint8_t* cp = static_cast<const uint8_t*>(f2.ck.at(hit.checkpoint_slot));
+        REQUIRE(cp != nullptr);
+        CHECK_EQ(cp[0], (uint8_t)0xA5);
+        CHECK_EQ(cp[ckpt_bytes - 1], (uint8_t)0xA5);
+
+        const auto sess = t2.sessions();
+        REQUIRE_EQ(sess.size(), 1u);
+        CHECK_EQ(sess[0].label, std::string("conv-alpha"));
+        CHECK_EQ(sess[0].snapshots, 2ll);
+        CHECK_EQ(sess[0].resume_tokens, 128ll);
+        CHECK(sess[0].id != 1ull);           /* high-bit namespace avoids request id 1 collision */
+        f2.pc.set_tiers(nullptr);
+    }
+
+    /* 2. Shrunk arena (4 slots instead of 16) keeps contiguous prefix 0..3 & ckpt at 64 only. */
+    {
+        Fixture f3;
+        REQUIRE_EQ(f3.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        IdleTiers t3;
+        IdleTiers::Config tc_small = tc;
+        tc_small.host_cap_bytes = entry_bytes * 4;
+        REQUIRE_EQ(t3.configure(tc_small), RAD_OK);
+        f3.pc.set_tiers(&t3);
+
+        KvSnapResult loaded{};
+        REQUIRE_EQ(kvsnap_load(snap_path, meta, &f3.pc, &t3, &f3.ck, &loaded), RAD_OK);
+        CHECK_EQ(loaded.entries, 4ll);
+        CHECK_EQ(loaded.ckpts, 1ll);
+        CHECK_EQ(loaded.sessions, 1ll);
+        CHECK_EQ(loaded.skipped_capacity, 4ll);
+
+        auto probe = tokens;
+        probe.push_back(99999);
+        const auto rest = f3.pc.restorable_from(probe, {});
+        CHECK_EQ(rest.size(), 4u);
+        f3.pc.set_tiers(nullptr);
+    }
+
+    /* 3. Fingerprint mismatch & truncated file fail safely without mutating target. */
+    {
+        Fixture f4;
+        REQUIRE_EQ(f4.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+        IdleTiers t4;
+        REQUIRE_EQ(t4.configure(tc), RAD_OK);
+        f4.pc.set_tiers(&t4);
+
+        KvSnapMeta bad = meta;
+        bad.fingerprint ^= 1ull;
+        CHECK_EQ(kvsnap_load(snap_path, bad, &f4.pc, &t4, &f4.ck), RAD_E_FORMAT);
+        CHECK_EQ(f4.pc.size(), 0ll);
+        CHECK_EQ(t4.arena().used_slots(), 0ll);
+        CHECK_EQ(f4.ck.used_slots(), 0ll);
+
+        /* Empty save removes stale file. */
+        CHECK_EQ(kvsnap_save(snap_path, meta, f4.pc, t4, &f4.ck), RAD_OK);
+        CHECK_EQ(kvsnap_load(snap_path, meta, &f4.pc, &t4, &f4.ck), RAD_E_NOTFOUND);
+        f4.pc.set_tiers(nullptr);
+    }
+
+    /* 4. Multi-threaded DirectFile (>4 MiB, 4096-aligned) save & restore round-trip. */
+    {
+        const int64_t big_entry = 516 * 1024;  /* matches Qwen3.5 516 KiB block */
+        const int64_t n_blocks  = 10;          /* > 4 MiB -> exercises multi-worker DirectFile */
+        Fixture fb1;
+        REQUIRE_EQ(fb1.build(/*with_linear=*/false, /*ckpt_slots=*/0), RAD_OK);
+        IdleTiers tb1;
+        IdleTiers::Config btc{};
+        btc.host_cap_bytes = big_entry * n_blocks;
+        btc.entry_bytes    = big_entry;
+        btc.block_tokens   = fb1.pc.block_size();
+        REQUIRE_EQ(tb1.configure(btc), RAD_OK);
+        fb1.pc.set_tiers(&tb1);
+
+        const auto btoks = tok_run(42000, n_blocks * fb1.pc.block_size());
+        publish(fb1, 1, btoks, (int64_t)btoks.size());
+        const auto bhs = chain_of(btoks);
+        REQUIRE_EQ((int64_t)bhs.size(), n_blocks);
+        tb1.note_session(1, bhs, (int64_t)btoks.size(), rad_mono_ns(), "big-dio");
+
+        std::vector<TierJob> wb2;
+        tb1.plan_writeback(n_blocks, &wb2);
+        REQUIRE_EQ((int64_t)wb2.size(), n_blocks);
+        std::unordered_map<BlockHash, uint8_t, BlockHashHash> bpat;
+        for (size_t i = 0; i < wb2.size(); ++i) {
+            const uint8_t fill = (uint8_t)(0x30 + i);
+            bpat[wb2[i].key] = fill;
+            std::memset(tb1.arena().at(wb2[i].host_slot), fill, (size_t)big_entry);
+            tb1.report(wb2[i], true);
+        }
+
+        KvSnapMeta bmeta{};
+        bmeta.fingerprint         = 0xfeedfacecafebeefull;
+        bmeta.block_size          = fb1.pc.block_size();
+        bmeta.entry_bytes         = big_entry;
+        bmeta.ckpt_bytes          = 0;
+        bmeta.checkpoint_interval = fb1.pc.checkpoint_interval();
+        bmeta.ttl_s               = 3600;
+
+        const std::string big_path =
+            (std::filesystem::temp_directory_path() /
+             fmt("rad_kvsnap_big_%lld.kvsnap", (long long)rad_mono_ns())).string();
+        KvSnapResult bsaved{};
+        REQUIRE_EQ(kvsnap_save(big_path, bmeta, fb1.pc, tb1, nullptr, &bsaved), RAD_OK);
+        CHECK_EQ(bsaved.entries, n_blocks);
+
+        Fixture fb2;
+        REQUIRE_EQ(fb2.build(/*with_linear=*/false, /*ckpt_slots=*/0), RAD_OK);
+        IdleTiers tb2;
+        REQUIRE_EQ(tb2.configure(btc), RAD_OK);
+        fb2.pc.set_tiers(&tb2);
+
+        KvSnapResult bloaded{};
+        REQUIRE_EQ(kvsnap_load(big_path, bmeta, &fb2.pc, &tb2, nullptr, &bloaded), RAD_OK);
+        CHECK_EQ(bloaded.entries, n_blocks);
+        auto bprobe = btoks;
+        bprobe.push_back(99999);
+        const auto brest = fb2.pc.restorable_from(bprobe, {});
+        REQUIRE_EQ((int64_t)brest.size(), n_blocks);
+        for (size_t i = 0; i < brest.size(); ++i) {
+            TierJob j;
+            REQUIRE(tb2.plan_promote(brest[i], &j));
+            const uint8_t* p = static_cast<const uint8_t*>(tb2.arena().at(j.host_slot));
+            REQUIRE(p != nullptr);
+            CHECK_EQ(p[0], bpat[brest[i]]);
+            CHECK_EQ(p[big_entry / 2], bpat[brest[i]]);
+            CHECK_EQ(p[big_entry - 1], bpat[brest[i]]);
+            tb2.report(j, false);
+        }
+
+        std::error_code ec;
+        std::filesystem::remove(big_path, ec);
+        fb2.pc.set_tiers(nullptr);
+        fb1.pc.set_tiers(nullptr);
+    }
+
+    f1.pc.set_tiers(nullptr);
 }
 
 RAD_TEST_MAIN()

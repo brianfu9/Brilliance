@@ -2910,6 +2910,82 @@ bool Engine::flush_copies() {
     return landed;
 }
 
+/* (local) Save-on-unload / load-on-bringup KV prefix cache persistence (core/mem/kvsnap.h). */
+void Engine::load_prefix_cache() {
+    if (cfg_.prefix_cache_file.empty() || ranks_.empty()) return;
+    Rank& lead = *ranks_[0];
+    if (!lead.prefix.enabled() || !lead.tiers.host_on() || kvsnap_meta_.entry_bytes <= 0) return;
+
+    RAD_INFO("kv snap: persistence enabled at %s (stores unencrypted KV/token data on local disk; "
+             "written only on clean unload/shutdown)", cfg_.prefix_cache_file.c_str());
+    KvSnapResult res{};
+    const int rc = kvsnap_load(cfg_.prefix_cache_file, kvsnap_meta_, &lead.prefix, &lead.tiers,
+                               ck_store_.enabled() ? &ck_store_ : nullptr, &res);
+    if (rc == RAD_E_NOTFOUND) {
+        RAD_INFO("kv snap: no existing snapshot at %s; starting cold",
+                 cfg_.prefix_cache_file.c_str());
+    } else if (rc == RAD_OK) {
+        RAD_INFO("kv snap: restored %lld block(s) (%lld tokens), %lld checkpoint(s), %lld "
+                 "session(s) (%s) from %s in %.2f s (skipped %lld expired, %lld capacity)",
+                 (long long)res.entries, (long long)(res.entries * kvsnap_meta_.block_size),
+                 (long long)res.ckpts, (long long)res.sessions,
+                 humanb(res.bytes).c_str(), cfg_.prefix_cache_file.c_str(), res.seconds,
+                 (long long)res.skipped_expired, (long long)res.skipped_capacity);
+    }
+}
+
+void Engine::save_prefix_cache() {
+    if (cfg_.prefix_cache_file.empty() || ranks_.empty() ||
+        parked_.load(std::memory_order_acquire))
+        return;
+    Rank& lead = *ranks_[0];
+    if (!lead.prefix.enabled() || !lead.tiers.host_on() || kvsnap_meta_.entry_bytes <= 0) return;
+
+    const std::string sl_name = "model." + cfg_.served_model_name;
+    stoplog::Step st(sl_name + ".kv_cache_save", stoplog::bound::kCacheSave);
+
+    /* Flush any dirty VRAM-only entries into pinned HostArena while GPU streams are still live. */
+    if (pump_ && lead.tierx.enabled()) {
+        (void)rad_dev_set(lead.device);
+        const uint64_t flush_start = rad_mono_ns();
+        for (int pass = 0; pass < 16; ++pass) {
+            if (lead.tiers.starved()) {
+                std::vector<TierJob> drops;
+                lead.tiers.plan(pump_->slow_budget, &drops);
+                if (!drops.empty()) {
+                    const std::vector<char> ok(drops.size(), 1);
+                    lead.tierx.report_pass(drops, ok, rad_mono_ns());
+                }
+            }
+            const bool progressed = flush_copies();
+            if (!lead.tiers.writeback_waiting() && pump_->copy.empty()) break;
+            if (!progressed && !lead.tiers.starved()) break;
+            if (rad_mono_ns() - flush_start > 10ull * 1000000000ull) break;
+        }
+    }
+
+    if (cfg_.prefix_cache_ttl > 0)
+        (void)lead.prefix.expire(rad_mono_ns(), (uint64_t)cfg_.prefix_cache_ttl * 1000000000ull);
+
+    kvsnap_meta_.ttl_s = cfg_.prefix_cache_ttl;
+    KvSnapResult res{};
+    const int rc = kvsnap_save(cfg_.prefix_cache_file, kvsnap_meta_, lead.prefix, lead.tiers,
+                               ck_store_.enabled() ? &ck_store_ : nullptr, &res);
+    if (rc == RAD_OK) {
+        if (res.entries > 0 || res.ckpts > 0)
+            RAD_INFO("kv snap: saved %lld block(s) (%lld tokens), %lld checkpoint(s), %lld "
+                     "session(s) (%s) to %s in %.2f s",
+                     (long long)res.entries, (long long)(res.entries * kvsnap_meta_.block_size),
+                     (long long)res.ckpts, (long long)res.sessions,
+                     humanb(res.bytes).c_str(), cfg_.prefix_cache_file.c_str(), res.seconds);
+        else
+            RAD_INFO("kv snap: cache empty on unload; cleared %s", cfg_.prefix_cache_file.c_str());
+    } else {
+        RAD_WARN("kv snap: save to %s failed (%s)",
+                 cfg_.prefix_cache_file.c_str(), rad_strerror(rc));
+    }
+}
+
 /* Drop the sampler's per-request state for requests that reached a terminal state. The server
  * drains their text through the sink and calls reap(), which releases the Request; only the HTTP
  * thread knows when it has stopped writing. */
@@ -3264,6 +3340,8 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         rank_threads_.clear();
     }
     xstats_close();
+    if (ever_served_ && loop_status_.load(std::memory_order_acquire) >= 0)
+        save_prefix_cache();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -4668,6 +4746,7 @@ int Engine::run_server() {
     startup_watch_.reset();
     srv.note_ready(startup_begin_ns_);
     front_->attach(cfg_.served_model_name, front_aliases_, &srv);
+    ever_served_ = true;
     serving_.store(true, std::memory_order_release);
     RAD_INFO("model %s: ready", cfg_.served_model_name.c_str());
     while (!front_->stopping() && !stop_requested_.load(std::memory_order_acquire)) {

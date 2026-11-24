@@ -45,6 +45,7 @@ constexpr int64_t kStreamProbe    = 2000;    /* each rank's streams found draine
 constexpr int64_t kCtxShutdown    = 10000;   /* a rank's streams synced and its arenas freed */
 constexpr int64_t kRelease        = 10000;   /* each later release step of an engine */
 constexpr int64_t kTeardown       = 60000;   /* one engine's whole teardown */
+constexpr int64_t kCacheSave      = 30000;   /* (local) save-on-unload KV cache snapshot */
 constexpr int64_t kFrontStop      = 5000;    /* the listener closes */
 }  // namespace bound
 

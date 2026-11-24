@@ -762,4 +762,71 @@ std::vector<IdleTiers::SessionInfo> IdleTiers::sessions(Occupancy* occ) const {
     }
     return out;
 }
+
+/* ------------------------------------------------------------------ snapshot persistence (local) */
+
+void IdleTiers::export_snap(std::vector<SnapHostRec>* host_recs,
+                            std::vector<SnapSession>* sessions) const {
+    std::lock_guard lk(mu_);
+    if (host_recs) {
+        host_recs->clear();
+        host_recs->reserve(recs_.size());
+        for (const auto& kvp : recs_) {
+            const Rec& r = kvp.second;
+            if (r.pending || r.doomed || r.host_slot < 0) continue;
+            SnapHostRec sr;
+            sr.key       = kvp.first;
+            sr.host_slot = r.host_slot;
+            sr.depth     = r.depth;
+            sr.used_ns   = r.used_ns;
+            host_recs->push_back(sr);
+        }
+    }
+    if (sessions) {
+        sessions->clear();
+        sessions->reserve(sessions_.size());
+        for (const auto& kvp : sessions_) {
+            SnapSession ss;
+            ss.id            = kvp.first;
+            ss.n_tokens      = kvp.second.n_tokens;
+            ss.first_seen_ns = kvp.second.first_seen_ns;
+            ss.last_used_ns  = kvp.second.last_used_ns;
+            ss.label         = kvp.second.label;
+            ss.chain         = kvp.second.chain;
+            sessions->push_back(std::move(ss));
+        }
+    }
+}
+
+int IdleTiers::import_host_rec(const BlockHash& key, int32_t host_slot, int64_t depth,
+                               uint64_t used_ns) {
+    if (!host_on() || host_slot < 0) return RAD_E_INVAL;
+    std::lock_guard lk(mu_);
+    if (recs_.count(key)) return RAD_E_STATE;
+    Rec& r = recs_[key];
+    r.tier      = KVTier::Host;
+    r.used_ns   = used_ns;
+    r.depth     = depth;
+    r.host_slot = host_slot;
+    r.pending   = false;
+    r.doomed    = false;
+    r.queued    = false;
+    r.clean_q   = false;
+    relist(key, r);
+    return RAD_OK;
+}
+
+void IdleTiers::import_session(uint64_t id, const std::vector<BlockHash>& chain, int64_t n_tokens,
+                               uint64_t first_seen_ns, uint64_t last_used_ns,
+                               const std::string& label) {
+    if (chain.empty()) return;
+    std::lock_guard lk(mu_);
+    Session& s = sessions_[id];
+    s.n_tokens      = n_tokens;
+    s.first_seen_ns = first_seen_ns;
+    s.last_used_ns  = last_used_ns;
+    s.chain         = chain;
+    s.label         = label;
+    roots_[chain[0]].push_back(id);
+}
 }  /* namespace rad */

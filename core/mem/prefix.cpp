@@ -1265,4 +1265,78 @@ int PrefixCache::release_session(const std::string& label, uint64_t id, int64_t 
     stats_.ckpt_released += out->snapshots;
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ snapshot persistence (local) */
+
+void PrefixCache::export_snap(std::vector<SnapEntry>* entries,
+                              std::vector<SnapCkpt>* ckpts) const {
+    if (entries) {
+        entries->clear();
+        entries->reserve(map_.size());
+        for (const auto& kvp : map_) {
+            SnapEntry se;
+            se.key        = kvp.first;
+            se.tokens     = kvp.second.tokens;
+            se.n_children = kvp.second.n_children;
+            se.used_ns    = kvp.second.used_ns;
+            entries->push_back(std::move(se));
+        }
+    }
+    if (ckpts) {
+        ckpts->clear();
+        ckpts->reserve(ck_by_prefix_.size());
+        for (const auto& kvp : ck_by_prefix_) {
+            const Ckpt& c = kvp.second;
+            if (!c.valid || c.slot < 0) continue;
+            SnapCkpt sc;
+            sc.prefix  = c.prefix;
+            sc.session = c.session;
+            sc.pos     = c.pos;
+            sc.slot    = c.slot;
+            sc.used    = c.used;
+            sc.made    = c.made;
+            sc.resumed = c.resumed;
+            sc.used_ns = c.used_ns;
+            ckpts->push_back(sc);
+        }
+    }
+}
+
+int PrefixCache::import_host_entry(const BlockHash& key, std::vector<int32_t> tokens,
+                                   uint8_t n_children, uint64_t used_ns) {
+    if (!enabled_ || (int64_t)tokens.size() != block_size_) return RAD_E_INVAL;
+    if (map_.count(key)) return RAD_E_STATE;
+    Entry e;
+    e.tokens     = std::move(tokens);
+    e.in_lru     = false;
+    e.drop_wait  = false;
+    e.n_children = n_children;
+    e.used_ns    = used_ns;
+    map_.emplace(key, std::move(e));
+    return RAD_OK;
+}
+
+int PrefixCache::import_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
+                                   int32_t slot, uint64_t used, uint64_t made, uint64_t resumed,
+                                   uint64_t used_ns) {
+    if (!enabled_ || !has_linear_ || slot < 0 || pos <= 0 || pos % block_size_ != 0)
+        return RAD_E_INVAL;
+    if (ck_by_prefix_.count(prefix)) return RAD_E_STATE;
+    Ckpt c;
+    c.session = session;
+    c.pos     = pos;
+    c.prefix  = prefix;
+    c.slot    = slot;
+    c.used    = used;
+    c.made    = made;
+    c.resumed = resumed;
+    c.used_ns = used_ns;
+    c.valid   = true;
+    ck_by_prefix_.emplace(prefix, c);
+    ++ck_positions_[pos];
+    ck_by_session_[session].push_back(prefix);
+    clock_ = std::max(clock_, std::max(used, std::max(made, resumed)));
+    if (tiers_) tiers_->note_snapshot(prefix, slot, pos);
+    return RAD_OK;
+}
 }  /* namespace rad */

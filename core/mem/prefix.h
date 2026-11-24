@@ -445,6 +445,28 @@ public:
      * sessions holding a live snapshot, not every request served. */
     int64_t sessions_tracked() const { return (int64_t)ck_by_session_.size(); }
 
+    /* ---------------- snapshot persistence (local, core/mem/kvsnap.h) ---------------- */
+    struct SnapEntry {
+        BlockHash            key;
+        std::vector<int32_t> tokens;
+        uint8_t              n_children = 0;
+        uint64_t             used_ns = 0;
+    };
+    struct SnapCkpt {
+        BlockHash prefix;
+        uint64_t  session = 0;
+        int64_t   pos = 0;
+        int32_t   slot = -1;
+        uint64_t  used = 0, made = 0, resumed = 0;
+        uint64_t  used_ns = 0;
+    };
+    void export_snap(std::vector<SnapEntry>* entries, std::vector<SnapCkpt>* ckpts) const;
+    int  import_host_entry(const BlockHash& key, std::vector<int32_t> tokens,
+                           uint8_t n_children, uint64_t used_ns);
+    int  import_checkpoint(uint64_t session, int64_t pos, const BlockHash& prefix,
+                           int32_t slot, uint64_t used, uint64_t made, uint64_t resumed,
+                           uint64_t used_ns);
+
     struct Stats {
         int64_t lookups = 0, block_hits = 0, block_misses = 0;
         int64_t ckpt_hits = 0, ckpt_misses = 0;

@@ -2126,10 +2126,15 @@ int Engine::plan() {
                  * length (guided speech holds two pieces for the whole piece, so nothing in flight
                  * waits for KV). Short of that, on cards other models fill, the cache cannot grow
                  * and such a request could never start. */
-                const int64_t one =
+                int64_t one =
                     r->program.is_audio_generator() ? ctx * (r->program.audio_gen.branches == 1 ? 1 : 2)
                     : r->program.is_generator()     ? ctx * 2
                                                     : ctx;
+                if (broker_ && !r->program.is_audio_generator() && !r->program.is_generator() &&
+                    VMem::supported() && broker_->flex_kv_max_tokens() != 0 &&
+                    broker_->flex_kv_min_tokens() > 0 && broker_->flex_kv_min_tokens() < one) {
+                    one = broker_->flex_kv_min_tokens();
+                }
                 const int64_t need = probe.pool_mib_for_tokens(one, (f.kv_ceiling + MiB - 1) / MiB);
                 if (need >= 0) f.kv_one = need * MiB;
                 kv_floor = std::max(kv_floor, f.kv_one);

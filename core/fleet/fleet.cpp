@@ -344,6 +344,9 @@ private:
         int64_t flex_kv_max_tokens() override {
             return m->entry.flex.kv_max_tokens >= 0 ? m->entry.flex.kv_max_tokens : -1;
         }
+        int64_t flex_kv_min_tokens() override {
+            return m->entry.flex.kv_min_tokens;
+        }
         bool    flex_grow(const std::vector<int>& c, int64_t b) override { return f->flex_grow(c, b); }
         void    flex_done() override { f->flex_done(); }
         int64_t flex_room(const std::vector<int>& c) override { return f->flex_room(c); }

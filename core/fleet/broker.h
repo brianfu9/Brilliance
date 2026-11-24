@@ -54,6 +54,10 @@ public:
     /* For the engine being granted: the most tokens its cache may grow to, 0 for none (it stays at
      * its claim), -1 for its ceiling. */
     virtual int64_t flex_kv_max_tokens() { return 0; }
+    /* Explicit flex.kv.min-tokens floor (< 0 if unset). When set below --max-model-len with VMem
+     * elastic KV enabled, allows the minimum backed KV floor to shrink below one full-length
+     * context so higher-priority models can co-reside without evicting weights. */
+    virtual int64_t flex_kv_min_tokens() { return -1; }
     /* May `bytes` more be backed on each of `cards` now? Never evicts and never blocks; refused
      * while the fleet is making room for a load. From an engine's step loop. */
     virtual bool    flex_grow(const std::vector<int>& cards, int64_t bytes) {

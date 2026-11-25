@@ -353,13 +353,13 @@ std::string Metrics::render() const {
               "Requests admission held in the queue until the KV pool could hold their whole "
               "prompt (--admit-kv-reserve).", L, c_admit_kv_held_.get());
     w.counter("radiance:claimants_total",
-              "Big waiters that crossed their hold window and became claimants with a committed "
-              "anchor (--admit-claimant).", L, c_claimants_total_.get());
+              "Big waiters that crossed their hold window and became claimants (--admit-claimant).",
+              L, c_claimants_total_.get());
     w.counter("radiance:claimant_admitted_total",
               "Claimants admitted at the head of the walk, ungated (--admit-claimant).",
               L, c_claimant_admitted_.get());
     w.counter("radiance:claimant_gate_blocked_total",
-              "Fillers refused because they would move a claimant's committed anchor later "
+              "Fillers refused by the capacity line-jump gate behind an active claimant "
               "(--admit-claimant).", L, c_claimant_gate_blocked_.get());
 
     w.help("vllm:request_success_total",

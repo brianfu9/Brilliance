@@ -34,8 +34,8 @@ struct SchedMetrics {
     int64_t preempt_forced = 0;
     /* --admit-kv-reserve: requests admission held at least once for KV room. */
     int64_t admit_kv_held = 0;
-    /* --admit-claimant: claimants first stamped (a big waiter crossed its hold window and got its
-     * anchor), claimants admitted, and fillers refused by the claimant's anchor gate. */
+    /* --admit-claimant: claimants first marked (a big waiter crossed its hold window), claimants
+     * admitted, and fillers refused by the capacity line-jump gate. */
     int64_t claimants_total = 0;
     int64_t claimant_admitted = 0;
     int64_t claimant_gate_blocked = 0;

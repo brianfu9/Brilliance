@@ -98,10 +98,10 @@ static const Flag g_flags[] = {
                                         "--admit-kv-reserve holds; after that nothing passes it.\n"
                                         "0 (default) never" },
     { "--admit-claimant",     nullptr,  "the frontmost big waiter held past --admit-backfill-ms is\n"
-                                        "asked before everything else, and no other admission may\n"
-                                        "move the wall time its pool room was committed to it\n"
-                                        "later (PLAN-admit-line-jump §6.8). Inert without\n"
-                                        "--admit-kv-reserve and --admit-backfill-ms" },
+                                        "asked first, and smaller fillers may skip past it only when\n"
+                                        "buffer plus the smallest pre-claim runner still fits the\n"
+                                        "claimant (with jumper reclaim on decode growth). Inert\n"
+                                        "without --admit-kv-reserve and --admit-backfill-ms" },
     { "--admit-claimant-min-pct", "N",  "a held waiter is big enough to claim when its whole\n"
                                         "commitment takes more than N% of the KV pool.\n"
                                         "50 (default) = more than half; 0 = any held waiter" },

@@ -150,20 +150,31 @@ $vs = $null
 if (Test-Path $vswhere) {
   $vsPath = (& $vswhere -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
   if ($vsPath) {
-    $msvc = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "$MsvcToolset.*" } | Sort-Object Name -Descending | Select-Object -First 1
+    $msvcDirs = @(Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue)
+    $msvc = $msvcDirs | Where-Object { $_.Name -like "$MsvcToolset.*" } | Sort-Object Name -Descending | Select-Object -First 1
+    $msvcFallback = $false
+    if (-not $msvc) {
+      $minVer = [version]"$MsvcToolset.0"
+      $msvc = $msvcDirs | Where-Object {
+        $v = $null; [version]::TryParse($_.Name, [ref]$v) -and $v.Major -eq $minVer.Major -and $v -ge $minVer
+      } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+      $msvcFallback = [bool]$msvc
+    }
     $vs = [pscustomobject]@{
-      Path   = $vsPath
-      Msvc   = $(if ($msvc) { $msvc.Name } else { $null })
-      Vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-      Sdk    = Test-Path (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$SdkVersion")
-      Libomp = Join-Path $vsPath 'VC\Tools\Llvm\x64'
+      Path         = $vsPath
+      Msvc         = $(if ($msvc) { $msvc.Name } else { $null })
+      MsvcFallback = $msvcFallback
+      Vcvars       = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+      Sdk          = Test-Path (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$SdkVersion")
+      Libomp       = Join-Path $vsPath 'VC\Tools\Llvm\x64'
     }
   }
 }
 if (-not $vs) { Say-Bad 'no Visual Studio with the MSVC x64 tools (install VS Build Tools 2026 with the C++ workload)' }
 else {
-  if ($vs.Msvc) { Say-Ok "MSVC toolset $($vs.Msvc) at $($vs.Path)" } else { Say-Bad "MSVC toolset $MsvcToolset.* is not installed in $($vs.Path) (Visual Studio Installer: Individual components)" }
+  if ($vs.Msvc -and $vs.MsvcFallback) { Say-Warn "MSVC toolset $($vs.Msvc) at $($vs.Path) (newer than tested $MsvcToolset.*)" }
+  elseif ($vs.Msvc) { Say-Ok "MSVC toolset $($vs.Msvc) at $($vs.Path)" }
+  else { Say-Bad "MSVC toolset $MsvcToolset.* (or newer $($MsvcToolset.Split('.')[0]).x) is not installed in $($vs.Path) (Visual Studio Installer: Individual components)" }
   if ($vs.Sdk) { Say-Ok "Windows SDK $SdkVersion" } else { Say-Bad "Windows SDK $SdkVersion is not installed" }
   if (Test-Path (Join-Path $vs.Libomp 'lib\libomp.lib')) { Say-Ok 'libomp (C++ Clang tools component)' }
   else { Say-Warn 'no libomp (VS component "C++ Clang tools for Windows"): the host kernels will build single-threaded' }

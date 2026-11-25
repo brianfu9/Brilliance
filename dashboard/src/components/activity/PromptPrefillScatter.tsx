@@ -22,12 +22,10 @@ import {
   type HeatGrid,
 } from "@/lib/activity/heatmap";
 import {
-  densityAlpha,
+  densityColor,
+  densityRamp,
   densityThresholds,
   latestSession,
-  newTokensColor,
-  NEW_TOKEN_LABELS,
-  withAlpha,
   shortSession,
   LATEST_DARK,
   LATEST_LIGHT,
@@ -48,8 +46,9 @@ interface Props {
 
 // x is the context the prefill ran against (cached + new tokens), not the new tokens alone: an agent
 // turn sends 2-4k new tokens at any context, so on that axis half of all requests share one narrow
-// column, while prefill speed falls by ~45% from 30k to 200k of context. The new tokens become the
-// cell's hue (geometric mean of its requests) and the request count its opacity.
+// column, while prefill speed falls by ~45% from 30k to 200k of context. Cell shade is the request
+// count (the same solid density ramp as the decode chart); the cell's new tokens (geometric mean)
+// stay in the tooltip.
 const xOf = (p: PromptScatterPoint) => (p.context !== undefined && p.context > 0 ? p.context : p.length);
 
 export function PromptPrefillScatter({ points }: Props) {
@@ -83,12 +82,12 @@ export function PromptPrefillScatter({ points }: Props) {
     };
   }
 
-  // Ramp steps are assigned by rank, so each shade carries a comparable slice
+  // Cell fill: the count drives the blue density ramp. Ramp steps are assigned by rank, so each shade carries a comparable slice
   // of the cells whatever the distribution looks like. See densityThresholds.
   const thresholds = useMemo(() => densityThresholds(grid.cells.map((c) => c.count)), [grid]);
 
   function cellColorFor(bounds: number[], dark: boolean) {
-    return (cell: HeatCell) => withAlpha(newTokensColor(cell.size, dark), densityAlpha(cell.count, bounds));
+    return (cell: HeatCell) => densityColor(cell.count, bounds, dark);
   }
 
   function cellOf(item: TooltipItem<"scatter">): HeatCell | undefined {
@@ -107,6 +106,8 @@ export function PromptPrefillScatter({ points }: Props) {
       responsive: true,
       maintainAspectRatio: false,
       animation: false as const,
+      // Hover only: a click on a heat chart does nothing (no click event reaches Chart.js).
+      events: ["mousemove", "mouseout", "touchstart", "touchmove"] as ("mousemove" | "mouseout" | "touchstart" | "touchmove")[],
       interaction: {
         // See DecodeScatter: a regular grid of cell centers makes "nearest
         // without intersect" resolve to the containing cell.
@@ -252,21 +253,17 @@ export function PromptPrefillScatter({ points }: Props) {
           <canvas ref={canvasRef} />
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span
-            className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5"
-            title={`fainter = fewer requests; opacity steps top out at ${thresholds.join(", ")} requests (max ${formatCompact(grid.maxCount)}/cell)`}
-          >
-            <span className="text-muted-foreground whitespace-nowrap text-xs">new tokens</span>
-            {NEW_TOKEN_LABELS.map((label, i) => (
-              <span key={label} className="flex items-center gap-0.5 whitespace-nowrap">
-                <span
-                  className="inline-block size-2"
-                  style={{ background: newTokensColor([1000, 3000, 6000, 16000, 64000][i], dark) }}
-                />
-                <span className="text-muted-foreground text-xs">{label}</span>
-              </span>
+          <span className="flex items-center gap-1">
+            <span className="text-muted-foreground text-xs">1</span>
+            {densityRamp(dark).map((step) => (
+              <span key={step} className="inline-block size-2" style={{ background: step }} />
             ))}
-            <span className="text-muted-foreground whitespace-nowrap text-xs">· fainter = fewer</span>
+            <span
+              className="text-muted-foreground text-xs"
+              title={`shade steps top out at: ${thresholds.join(", ")} requests`}
+            >
+              {formatCompact(grid.maxCount)} req/cell
+            </span>
           </span>
           {overlay.length > 0 && (
             <span className="flex items-center gap-1">

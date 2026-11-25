@@ -89,6 +89,8 @@ export function DecodeScatter({
       responsive: true,
       maintainAspectRatio: false,
       animation: false as const,
+      // Hover only: a click on a heat chart does nothing (no click event reaches Chart.js).
+      events: ["mousemove", "mouseout", "touchstart", "touchmove"] as ("mousemove" | "mouseout" | "touchstart" | "touchmove")[],
       interaction: {
         // Cell centers sit on a regular grid, so "nearest without intersect"
         // resolves to the cell the cursor is actually inside, and an overlay

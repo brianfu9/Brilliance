@@ -148,6 +148,8 @@ export function ConcurrencyHeat({ data }: { data: ConcurrencyData }) {
       responsive: true,
       maintainAspectRatio: false,
       animation: false as const,
+      // Hover only: a click on a heat chart does nothing (no click event reaches Chart.js).
+      events: ["mousemove", "mouseout", "touchstart", "touchmove"] as ("mousemove" | "mouseout" | "touchstart" | "touchmove")[],
       interaction: { mode: "nearest" as const, intersect: false },
       plugins: {
         legend: { display: false },

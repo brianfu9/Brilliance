@@ -34,6 +34,7 @@
 #include "../arch/gemma4/gemma4.cpp"
 /* Qwen3-ASR: a Whisper-style audio tower over a dense Qwen3 decoder. */
 #include "../arch/qwen3asr_bf16/qwen3asr_bf16.cpp"
+#include "../arch/qwen3asr_q/qwen3asr_q.cpp"
 /* Unlimited-OCR: the Llama-MoE decoder and its DeepEncoder tower (SAM + CLIP). */
 #include "../arch/unlimitedocr_bf16/unlimitedocr_bf16.cpp"
 /* The PLE block alone: no architecture here declares it, and what its step() hands the two
@@ -14087,6 +14088,54 @@ TEST(qwen3asr_refuses_a_tower_it_does_not_serve) {
     CHECK_OK(qwen3asr_bf16::declare(&bt, &ok, &text));
     CHECK(bt.audio_encoder_name.empty());
     CHECK_EQ(count_op(bt, "conv2d"), 0);
+}
+
+/* W8A8 int8 FFN + int8 lm_head with bf16 attention and bf16 audio encoder (16 s pass). */
+TEST(qwen3asr_q_declares_w8a8_ffn_int8_head_and_bf16_attn_tower) {
+    RadModelMeta meta = qwen3asr_meta();
+    meta.quant = "w8a8";
+    const RadEncoding w8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    RadBuilder b;
+    b.encs = {
+        { "ffn_gate_up.weight", w8 },
+        { "ffn_down.weight",    w8 },
+        { "output.weight",      w8 },
+    };
+    RadBuildCtx ctx = build_ctx();
+    ctx.max_audio_frames = 1664;
+    CHECK_OK(qwen3asr_q::declare(&b, &meta, &ctx));
+
+    CHECK_EQ(b.audio_encoder.max_patches, 1664);
+    CHECK_EQ(count_op(b, "attn_paged"), 2);
+    CHECK_EQ(count_op(b, "conv2d"), 1);
+    int i8_gemms = 0;
+    for (const RecOp& op : b.ops)
+        if (op.op == "gemm_nt_q" && pstr(&op, "dtype") == "i8a8") ++i8_gemms;
+    CHECK_EQ(i8_gemms, 4);
+    CHECK_EQ(count_op(b, "quant_act_i8g"), 4);
+    const RecWeight* head = find_w(b, "output.weight");
+    REQUIRE(head != nullptr);
+    CHECK_EQ(head->d.dtype, (uint32_t)RAD_I8);
+
+    RadBatch batch = decode_batch();
+    RadCtx run{}; run.b = &b; run.batch = &batch;
+    qwen3asr_q::step(&run, &batch);
+    CHECK(lint_step(b, {&run}).empty());
+
+    static uint16_t frames[208 * 128];
+    static int32_t  coord[4 * 208];
+    static const int32_t cu[] = { 0, 208 };
+    RadBatch enc{};
+    enc.enc         = RAD_MM_AUDIO;
+    enc.enc_n_patch = 208;
+    enc.enc_pixels  = frames;
+    enc.enc_coord   = coord;
+    enc.enc_n_seg   = 1;
+    enc.enc_cu      = cu;
+    enc.enc_max_seg = 208;
+    RadCtx cr{}; cr.b = &b; cr.rank = 0; cr.world = 1; cr.batch = &enc;
+    qwen3asr_q::step(&cr, &enc);
+    CHECK(cr.step_fail.empty());
 }
 
 /* A control vector's projection is declared for the layers whose scale is nonzero, and issued only

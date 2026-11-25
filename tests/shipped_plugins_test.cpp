@@ -105,7 +105,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "museglimmer", "compressed-tensors" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
         { "qwen35moe", "w8a8_fwht128" },
-        { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
+        { "qwen3asr", "" }, { "qwen3asr", "w8a8" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
         { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
         { "unlimitedocr", "" } };

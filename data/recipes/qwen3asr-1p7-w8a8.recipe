@@ -1,0 +1,11 @@
+# qwen3asr-1p7-w8a8.recipe -- Qwen3-ASR-1.7B with W8A8 int8 decoder FFN and int8 lm_head,
+# served by qwen3asr_q (attention and audio encoder stay bf16).
+#
+#   rad-convert <Qwen3-ASR-1.7B bf16 checkpoint> \
+#       --recipe data/recipes/qwen3asr-1p7-w8a8.recipe \
+#       --set quantization_config.quant_method=w8a8 \
+#       -o qwen3asr-1p7-w8a8.rad
+
+blk.*.ffn_gate_up.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym
+blk.*.ffn_down.weight                rtn  codes=i8 group=128 scale=bf16 clamp=sym
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym

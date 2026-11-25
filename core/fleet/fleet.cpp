@@ -3120,9 +3120,31 @@ void Fleet::add_routes() {
      * `GET /history/requests` and the `requests` tail of `GET /history?model=` enforce
      * `operator_ok` consistently. */
     if (const char* d = std::getenv("RADIANCE_HISTORY_DIR"); d && *d) history_.set_dir(d);
+    /* (local) The body store's cap in MiB (default 2048; 0 keeps none). */
+    if (const char* c = std::getenv("RADIANCE_HISTORY_BODIES_MIB"); c && *c)
+        history_.set_body_cap((int64_t)std::strtoll(c, nullptr, 10) << 20);
     front_.set_record_sink([this](const std::string& model, json rec) { history_.request_done(model, std::move(rec)); });
     front_.route("GET", "/history/requests", [this](const server::HttpRequest& q) {
         return server::handle_history_requests(history_, q, operator_ok(q));
+    });
+    /* (local) One request's body and reply: GET /history/body?rid=&loc= (loc = the row's `body`).
+     * Prompts and tool output can hold secrets, so this answers the local operator only, never a
+     * caller that merely holds the API key. */
+    front_.route("GET", "/history/body", [this](const server::HttpRequest& q) {
+        const Config& c = fc_.models.front().cfg;
+        if (q.missing_key || !server::local_operator(q, c.host, c.allow_hosts))
+            return server::HttpResponse::json_body(
+                403, R"({"error":{"message":"request bodies are for the local operator only","type":"permission_error"}})");
+        const auto rid = q.query.find("rid");
+        const auto loc = q.query.find("loc");
+        if (rid == q.query.end() || loc == q.query.end())
+            return server::HttpResponse::json_body(
+                400, R"({"error":{"message":"rid and loc are required","type":"invalid_request_error"}})");
+        std::string s = history_.body_at(loc->second, rid->second);
+        if (s.empty())
+            return server::HttpResponse::json_body(
+                404, R"({"error":{"message":"no body kept for this request","type":"not_found_error"}})");
+        return server::HttpResponse::json_body(200, std::move(s));
     });
     front_.route("GET", "/history", [this, guard](const server::HttpRequest& q) {
         double since = 0;

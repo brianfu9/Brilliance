@@ -69,6 +69,17 @@ public:
     /* The keys of a request record, in the order requests_body writes them. */
     static const std::vector<std::string>& record_keys();
 
+    /* (local) Request and reply bodies. A record that carries `_body` ({"request": the POSTed JSON
+     * text, "reply": [...]}) has it stripped before the row is written; the body goes to
+     * <dir>/bodies/seg-NNNNNN.jsonl as one line and the row's `body` member names it as
+     * "seg:offset:length". Segments roll at kBodySegBytes; past the cap (RADIANCE_HISTORY_BODIES_MIB,
+     * default 2048; 0 keeps none) the oldest segments are deleted. Nothing is kept without a dir. */
+    static constexpr int64_t kBodySegBytes = (int64_t)256 << 20;
+    void set_body_cap(int64_t bytes);
+    /* The body line a row's `body` locator names, checked against `rid`; "" when it is gone or the
+     * locator is not one this store wrote. */
+    std::string body_at(const std::string& locator, const std::string& rid) const;
+
     /* One sample of a model from its /stats object (`body` its text), `t` in unix seconds. */
     void model_sample(const std::string& id, const json& stats, double t, std::string body = std::string());
     /* One sample of the fleet from /admin/fleet's object. */
@@ -134,6 +145,16 @@ private:
     void load_tail_locked(const std::string& path, const std::string& fallback_model,
                           Log& g, int64_t* max_n);
     void trim_locked(const std::string& model, Log& g);
+
+    /* (local) The body store; all under log_mu_. */
+    int64_t                      body_cap_ = (int64_t)2048 << 20;
+    int64_t                      body_seg_ = 0;        /* current segment number; 0 = none yet */
+    int64_t                      body_seg_bytes_ = 0;
+    std::map<int64_t, int64_t>   body_segs_;           /* segment -> bytes, oldest first */
+    std::string body_dir_locked() const;
+    std::string body_seg_path_locked(int64_t seg) const;
+    void        body_scan_locked();
+    std::string body_write_locked(const json& body);   /* returns the locator, "" when not written */
 
     mutable std::mutex           log_mu_;
     std::string                  dir_;

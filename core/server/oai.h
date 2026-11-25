@@ -105,6 +105,9 @@ struct OaiRequest {
      * User-Agent and X-Forwarded-For, and its session header (X-Session-ID or
      * X-Litellm-Session-Id, the ones llama-swap read), "" where absent. */
     std::string path, user_agent, forwarded_for, session_header;
+    /* (local) The request as the client POSTed it, for the history's body store (History::body_at);
+     * empty when bodies are not kept (RADIANCE_HISTORY_BODIES=0). */
+    std::string raw_body;
     /* The build, as OpenAI's and llama.cpp's `system_fingerprint`. */
     std::string system_fingerprint;
 

@@ -604,7 +604,7 @@ const std::vector<std::string>& History::record_keys() {
     static const std::vector<std::string> k = {
         "n", "t0", "t1", "rid", "model", "fm", "kind", "path", "sse", "code", "err", "src", "ua",
         "cache", "in", "out", "dn", "da", "pms", "dms", "prms", "ms", "pps", "tps", "ttft",
-        "audio_s", "ses", "pri", "tag" };
+        "audio_s", "ses", "pri", "tag", "body" };
     return k;
 }
 
@@ -647,6 +647,7 @@ void History::set_dir(const std::string& dir) {
     std::error_code ec;
     std::filesystem::create_directories(dir_, ec);
     RAD_INFO("history: finished requests are kept in %s", dir_.c_str());
+    body_scan_locked();
 
     std::vector<std::pair<std::string, std::string>> files;
     std::error_code it_ec;
@@ -771,6 +772,19 @@ void History::request_done(const std::string& model, json rec) {
     if (!rec.contains("kind") || !rec["kind"].is_string() || rec["kind"].get<std::string>().empty())
         rec["kind"] = "chat";
     rec["n"] = next_global_n_++;
+    /* (local) The bodies go to their own store; the row keeps only where. */
+    if (auto it = rec.find("_body"); it != rec.end()) {
+        json body = std::move(*it);
+        rec.erase(it);
+        if (body.is_object() && !dir_.empty() && !dir_failed_ && body_cap_ > 0) {
+            body["rid"] = rec.value("rid", std::string());
+            body["n"] = rec["n"];
+            body["model"] = model;
+            body["t1"] = rec.value("t1", (int64_t)0);
+            const std::string loc = body_write_locked(body);
+            if (!loc.empty()) rec["body"] = loc;
+        }
+    }
     const std::string line = rec.dump(-1, ' ', false, json::error_handler_t::replace);
     if (!dir_.empty() && !dir_failed_) {
         const std::string path = g.file_path.empty() ? file_of(model) : g.file_path;
@@ -791,6 +805,100 @@ void History::request_done(const std::string& model, json rec) {
         g.recent.pop_front();
         g.evicted = true;
     }
+}
+
+/* ---- (local) body store ---- */
+
+void History::set_body_cap(int64_t bytes) {
+    std::lock_guard<std::mutex> lg(log_mu_);
+    body_cap_ = bytes < 0 ? 0 : bytes;
+}
+
+std::string History::body_dir_locked() const {
+    return (std::filesystem::path(dir_) / "bodies").string();
+}
+
+std::string History::body_seg_path_locked(int64_t seg) const {
+    char name[32];
+    std::snprintf(name, sizeof name, "seg-%06lld.jsonl", (long long)seg);
+    return (std::filesystem::path(body_dir_locked()) / name).string();
+}
+
+void History::body_scan_locked() {
+    body_segs_.clear();
+    body_seg_ = 0;
+    body_seg_bytes_ = 0;
+    std::error_code ec;
+    std::filesystem::create_directories(body_dir_locked(), ec);
+    for (const auto& e : std::filesystem::directory_iterator(body_dir_locked(), ec)) {
+        const std::string f = e.path().filename().string();
+        if (f.size() != 16 || f.compare(0, 4, "seg-") != 0 || f.compare(10, 6, ".jsonl") != 0) continue;
+        const int64_t seg = std::strtoll(f.c_str() + 4, nullptr, 10);
+        if (seg <= 0) continue;
+        std::error_code ec2;
+        const auto sz = std::filesystem::file_size(e.path(), ec2);
+        body_segs_[seg] = ec2 ? 0 : (int64_t)sz;
+    }
+    if (!body_segs_.empty()) {
+        body_seg_ = body_segs_.rbegin()->first;
+        body_seg_bytes_ = body_segs_.rbegin()->second;
+    }
+}
+
+std::string History::body_write_locked(const json& body) {
+    const std::string line = body.dump(-1, ' ', false, json::error_handler_t::replace);
+    if ((int64_t)line.size() + 1 > body_cap_) return std::string();
+    if (body_seg_ == 0 || body_seg_bytes_ + (int64_t)line.size() + 1 > kBodySegBytes) {
+        body_seg_ = body_seg_ + 1;
+        body_seg_bytes_ = 0;
+        body_segs_[body_seg_] = 0;
+    }
+    const std::string path = body_seg_path_locked(body_seg_);
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out) return std::string();
+    const int64_t off = body_seg_bytes_;
+    out << line << '\n';
+    out.flush();
+    if (!out) return std::string();
+    body_seg_bytes_ += (int64_t)line.size() + 1;
+    body_segs_[body_seg_] = body_seg_bytes_;
+    /* The cap: drop whole segments, oldest first, never the one being written. A segment a reader
+     * holds open (Windows) stays until a later write tries again. */
+    int64_t total = 0;
+    for (const auto& [s, b] : body_segs_) total += b;
+    for (auto it = body_segs_.begin(); total > body_cap_ && it != body_segs_.end() && it->first != body_seg_;) {
+        std::error_code ec;
+        std::filesystem::remove(body_seg_path_locked(it->first), ec);
+        if (ec && std::filesystem::exists(body_seg_path_locked(it->first))) { ++it; continue; }
+        total -= it->second;
+        it = body_segs_.erase(it);
+    }
+    char loc[64];
+    std::snprintf(loc, sizeof loc, "%lld:%lld:%lld", (long long)body_seg_, (long long)off,
+                  (long long)line.size());
+    return loc;
+}
+
+std::string History::body_at(const std::string& locator, const std::string& rid) const {
+    long long seg = 0, off = 0, len = 0;
+    char tail = 0;
+    if (std::sscanf(locator.c_str(), "%lld:%lld:%lld%c", &seg, &off, &len, &tail) != 3) return std::string();
+    if (seg <= 0 || off < 0 || len <= 0 || len > kBodySegBytes) return std::string();
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lg(log_mu_);
+        if (dir_.empty() || !body_segs_.count(seg)) return std::string();
+        path = body_seg_path_locked(seg);
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::string();
+    in.seekg(off);
+    std::string s((size_t)len, '\0');
+    in.read(&s[0], len);
+    if (in.gcount() != len) return std::string();
+    const json j = json::parse(s, nullptr, false);
+    if (!j.is_object() || j.value("rid", std::string()) != rid) return std::string();
+    return s;
 }
 
 std::string History::requests_page(const RequestsQuery& q) const {

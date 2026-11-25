@@ -584,3 +584,67 @@ TEST(request_done_handles_invalid_utf8_without_throwing) {
 }
 
 RAD_TEST_MAIN()
+
+/* (local) Bodies go to their own store; the row names where, survives a restart, and the cap drops
+ * the oldest segments. */
+TEST(request_bodies_are_kept_beside_the_row_and_found_by_its_locator) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    std::string loc;
+    {
+        History h;
+        h.set_dir(dir);
+        json rec = json::parse(R"({"rid": "chatcmpl-1", "t1": 1000, "out": 3})");
+        rec["_body"] = { { "request", R"({"messages":[{"role":"user","content":"hi"}]})" },
+                         { "reply", json::array({ { { "text", "hello" }, { "finish", "stop" } } }) } };
+        h.request_done("qwen27b", rec);
+        h.request_done("qwen27b", json::parse(R"({"rid": "chatcmpl-2", "t1": 1001})"));   /* no body */
+        const json b = json::parse(h.requests_body("qwen27b"));
+        int col = -1;
+        for (size_t i = 0; i < b["keys"].size(); ++i) if (b["keys"][i] == "body") col = (int)i;
+        REQUIRE(col >= 0);
+        REQUIRE(b["rows"][0][col].is_string());
+        loc = b["rows"][0][col].get<std::string>();
+        CHECK(b["rows"][1][col].is_null());
+        /* The row itself holds no body text. */
+        CHECK(h.requests_body("qwen27b").find("hello") == std::string::npos);
+    }
+    History h;
+    h.set_dir(dir);
+    const json got = json::parse(h.body_at(loc, "chatcmpl-1"));
+    CHECK_EQ(got["reply"][0]["text"].get<std::string>(), "hello");
+    CHECK(got["request"].get<std::string>().find("\"hi\"") != std::string::npos);
+    CHECK_EQ(got["model"].get<std::string>(), "qwen27b");
+    CHECK(h.body_at(loc, "chatcmpl-other").empty());          /* rid must match */
+    CHECK(h.body_at("9:0:10", "chatcmpl-1").empty());         /* no such segment */
+    CHECK(h.body_at("../1:0:10", "chatcmpl-1").empty());      /* not a locator */
+    remove_dir(dir);
+}
+
+TEST(the_body_store_cap_drops_whole_old_segments) {
+    const std::string dir = temp_dir();
+    REQUIRE(!dir.empty());
+    History h;
+    h.set_dir(dir);
+    h.set_body_cap(History::kBodySegBytes + (History::kBodySegBytes / 2));
+    const std::string big(History::kBodySegBytes / 3, 'x');
+    std::string first, last;
+    for (int i = 0; i < 9; ++i) {
+        json rec = json::parse(R"({"t1": 1})");
+        rec["rid"] = "r" + std::to_string(i);
+        rec["_body"] = { { "request", big }, { "reply", json::array() } };
+        h.request_done("m", rec);
+    }
+    const json b = json::parse(h.requests_body("m"));
+    int col = -1;
+    for (size_t i = 0; i < b["keys"].size(); ++i) if (b["keys"][i] == "body") col = (int)i;
+    REQUIRE(col >= 0);
+    first = b["rows"][0][col].get<std::string>();
+    last = b["rows"][8][col].get<std::string>();
+    CHECK(h.body_at(first, "r0").empty());                     /* its segment was dropped */
+    CHECK(!h.body_at(last, "r8").empty());
+    uintmax_t total = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir + "/bodies")) total += e.file_size();
+    CHECK(total <= (uintmax_t)(History::kBodySegBytes * 2));
+    remove_dir(dir);
+}

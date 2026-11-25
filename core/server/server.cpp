@@ -1056,6 +1056,40 @@ static SuccessReason to_reason(Finish f) {
     }
 }
 
+/* (local) Bodies are kept unless RADIANCE_HISTORY_BODIES=0; History keeps them only with a dir. */
+static bool keep_bodies() {
+    static const bool on = [] {
+        const char* v = std::getenv("RADIANCE_HISTORY_BODIES");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+/* (local) A data: URL's payload (base64 image or audio) is replaced by its size: the store is for
+ * reading what was asked, and one image would outweigh a long conversation. */
+static std::string strip_data_urls(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const size_t d = s.find("data:", i);
+        if (d == std::string::npos) { out.append(s, i, std::string::npos); break; }
+        const size_t semi = s.find(";base64,", d);
+        const size_t quote = s.find('"', d);
+        if (semi == std::string::npos || (quote != std::string::npos && quote < semi) || semi - d > 80) {
+            out.append(s, i, d + 5 - i);
+            i = d + 5;
+            continue;
+        }
+        size_t e = semi + 8;
+        while (e < s.size() && s[e] != '"' && s[e] != '\\') ++e;
+        out.append(s, i, semi - i);
+        out += ";" + std::to_string(e - (semi + 8)) + " base64 bytes omitted";
+        i = e;
+    }
+    return out;
+}
+
 void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Finish overall,
                     bool quiet, bool to_history) {
     int64_t n_prompt = 0;
@@ -1112,7 +1146,25 @@ void Server::record(const OaiRequest& r, const std::vector<Generation>& gens, Fi
     }
     if (sink) {
         try {
-            sink(request_record(r, t, overall, n_gen, e2e));
+            json rec = request_record(r, t, overall, n_gen, e2e);
+            /* (local) The engine's own reason, not only that it failed. */
+            if (overall == Finish::Error)
+                for (const auto& g : gens)
+                    if (g.finish == Finish::Error && g.sink) { rec["err"] = utf8_sanitize(engine_failure(*g.sink)); break; }
+            if (!r.raw_body.empty()) {
+                json reply = json::array();
+                for (const auto& g : gens) {
+                    json c;
+                    c["text"] = utf8_sanitize(g.text);
+                    c["finish"] = finish_reason_oai(g.finish);
+                    reply.push_back(std::move(c));
+                }
+                json body;
+                body["request"] = utf8_sanitize(strip_data_urls(r.raw_body));
+                body["reply"] = std::move(reply);
+                rec["_body"] = std::move(body);
+            }
+            sink(std::move(rec));
         } catch (...) {}
     }
 }
@@ -1846,6 +1898,7 @@ HttpResponse Server::handle_messages(const HttpRequest& req) {
 
 HttpResponse Server::serve(const HttpRequest& req, OaiRequest& r) {
     copy_http_meta(req, r);
+    if (keep_bodies()) r.raw_body = req.body;
     if (auto no = admit(r.n_choices(), req.peer, r.shape, r.prompts.size() > 1 ? "prompt" : "n"))
         return *no;
     log_admitted(r);

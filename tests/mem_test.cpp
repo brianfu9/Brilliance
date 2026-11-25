@@ -8740,6 +8740,32 @@ TEST(reclaim_above_reaches_spare_tokens_goal_with_buf_blocks) {
     CHECK(!x.f.pc.restorable_from(s.b, {}).empty());
 }
 
+/* Regression: KVManager::can_grow() on a fixed RAD_KV_WINDOW group (e.g. a drafter's rolling
+ * window) must cap `want` at window_seq_cap instead of demanding ceil(n_tokens/bs) blocks from
+ * a pool only sized for max_seqs * window_seq_cap. */
+TEST(can_grow_caps_window_group_at_window_seq_cap) {
+    auto groups = hybrid_groups();
+    groups.push_back(paged_group("swa", RAD_KV_WINDOW, 4, 16, { 6, 7 }, /*window=*/64));
+    Fixture f;
+    f.cfg.max_seqs = 4;
+    f.cfg.max_ctx  = 4096;
+    f.cfg.checkpoint_slots = 0;
+    CHECK_OK(configure_pools(f.pools, f.cfg));
+    CHECK_OK(f.kv.plan_groups(groups, f.cfg));
+    CHECK_OK(f.kv.carve(f.pools.kv()));
+    const int32_t g_win = (int32_t)groups.size() - 1;
+    const int64_t win_tot = f.kv.total_blocks(g_win);
+    const int64_t full_tot = f.kv.total_blocks(G_FULL);
+    REQUIRE(win_tot > 0 && win_tot < full_tot);
+    /* Pick a sequence length strictly larger than the entire window pool, yet within G_FULL. */
+    const int64_t big_tok = std::min(win_tot + 32, full_tot) * 16;
+    REQUIRE(big_tok > win_tot * 16);
+    CHECK_OK(f.kv.add_sequence(1));
+    for (int64_t t = 64; t <= big_tok; t += 64) CHECK_OK(f.kv.ensure(1, t));
+    f.kv.preempt(1);                  /* back to 0 tokens, first_block_pos = 0 */
+    CHECK(f.kv.can_grow(1, big_tok));
+}
+
 RAD_TEST_MAIN()
 
 /* A streamed-only op exists only when the architecture's capability table says it can stream AND

@@ -1994,10 +1994,11 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     auto enough = [&](int64_t hit) {
         for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
             const KVGeom::G& gg = kvgeom_.g[g];
-            /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting
-             * it wanted the whole prompt from a pool of none and kept a preempted request out for
-             * good. */
-            if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+            /* Full-attention paged groups only: a window/ring group (e.g. a drafter's rolling
+             * window) recycles blocks below its window and is sized for every sequence's window,
+             * so counting a long prompt's whole length against it livelocks preempted requests
+             * (same rule as fresh_prefill_can_fit and fresh_fits). */
+            if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
             int64_t need = (target + gg.block_size - 1) / gg.block_size -
                            (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
             if (need < 0) need = 0;
@@ -2196,9 +2197,13 @@ int32_t Scheduler::find_claimant(size_t* pos_out) const {
     const int64_t now = mono_us();
     for (size_t k = 0; k < waiting_.size(); ++k) {
         const SchedReq& s = *reqs_[(size_t)waiting_[k]];
-        if (s.req && s.req->state == ReqState::Waiting && s.req->n_computed == 0 &&
-            claim_is_big(s) && s.held_us != 0 &&
-            now - s.held_us >= cfg_.admit_backfill_ms * 1000) {
+        if (!s.req || !claim_is_big(s)) continue;
+        const bool fresh_held =
+            s.req->state == ReqState::Waiting && s.req->n_computed == 0 &&
+            s.held_us != 0 && now - s.held_us >= cfg_.admit_backfill_ms * 1000;
+        const bool pre_overdue =
+            s.req->state == ReqState::Preempted && preempt_wait_overdue(s);
+        if (fresh_held || pre_overdue) {
             if (pos_out) *pos_out = k;
             return waiting_[k];
         }
@@ -2217,8 +2222,12 @@ bool Scheduler::claim_reclaim_jumpers() {
     if (claim_reclaim_id_ == hid && step_seq_ - claim_reclaim_step_ < kClaimReclaimCooldownSteps)
         return false;
     if (cs.req->media && !media_ready(cs)) return false;
-    const bool fits_now = fresh_fits(cs) && (int64_t)running_.size() < cfg_.max_seqs;
-    if (fits_now) return false;
+    const bool is_pre = cs.req->state == ReqState::Preempted;
+    auto claimant_fits = [&] {
+        return (is_pre ? preempted_can_prefill(cs) : fresh_fits(cs)) &&
+               (int64_t)running_.size() < cfg_.max_seqs;
+    };
+    if (claimant_fits()) return false;
 
     /* Only jumpers with priority <= claimant's priority may be reclaimed (never invert priority
      * by preempting a higher-priority bypasser for a lower-priority claimant). */
@@ -2238,10 +2247,22 @@ bool Scheduler::claim_reclaim_jumpers() {
         const int64_t total = kv_->total_blocks((int32_t)g);
         if (kvgeom_.g[g].kind != RAD_KV_FULL || total <= 0) continue;
         const int64_t cap = std::min(total, kv_->held_blocks((int32_t)g) + kv_->available_blocks((int32_t)g));
-        int64_t need = gate_blocks(cs, g, true);
+        const int64_t bs = std::max<int64_t>(kvgeom_.g[g].block_size, 1);
+        int64_t need = is_pre
+            ? (cs.seq_len() + bs - 1) / bs + non_jumpers
+            : gate_blocks(cs, g, true);
         for (int32_t slot : running_) {
             const SchedReq& rs = *reqs_[(size_t)slot];
-            if (rs.req && !reclaimable(rs)) need += gate_blocks(rs, g, false);
+            if (!rs.req || reclaimable(rs)) continue;
+            if (is_pre) {
+                const Request& rr = *rs.req;
+                int64_t goal = rr.n_computed + 1;
+                if (rr.n_computed < (int64_t)rr.prompt.size())
+                    goal = std::max(goal, (int64_t)rr.prompt.size());
+                need += (goal + bs - 1) / bs;
+            } else {
+                need += gate_blocks(rs, g, false);
+            }
         }
         if (need > cap) return false;
     }
@@ -2249,7 +2270,7 @@ bool Scheduler::claim_reclaim_jumpers() {
     /* Preempt reclaimable jumpers (lowest priority first, then newest arrival) until cs fits,
      * so cs is admitted in this same step. */
     bool preempted = false;
-    while (!fresh_fits(cs) || (int64_t)running_.size() >= cfg_.max_seqs) {
+    while (!claimant_fits()) {
         int32_t victim = -1;
         int best_pri = INT_MAX;
         uint64_t newest = 0;
@@ -2324,6 +2345,7 @@ const RadBatch* Scheduler::step() {
      * pool that fits two is exactly when that reset repeats. Past this gate a decoder can still
      * be preempted after its prompt is built. */
     bool overdue = false;
+    bool overdue_forced = false;
     for (int32_t slot : waiting_) {
         const SchedReq& s = *reqs_[(size_t)slot];
         if (s.req && s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
@@ -2388,6 +2410,7 @@ const RadBatch* Scheduler::step() {
                 running_.push_back(victim);
             }
             if (preempt_back()) evict_rounds = 0;   /* its blocks stay in the cache: evict them first */
+            overdue_forced = true;
         }
     }
 
@@ -2420,7 +2443,7 @@ const RadBatch* Scheduler::step() {
     /* --admit-claimant: if a held claimant can fit once its own labelled jumpers yield, reclaim
      * them before running_ is planned into plan_.e so the claimant is admitted this step. Re-scan
      * any_decoding afterwards so mixed_target_active_ reflects the post-reclaim runners. */
-    const bool reclaimed_jumpers = !hold_prefill && claim_reclaim_jumpers();
+    const bool reclaimed_jumpers = !hold_prefill && !overdue_forced && claim_reclaim_jumpers();
     if (reclaimed_jumpers) {
         any_decoding = scan_decoding();
         if (!any_decoding) interleave_left_ = 0;
@@ -2759,7 +2782,7 @@ const RadBatch* Scheduler::step() {
          * DESC, gated KV footprint ASC, arrival ASC) and gated by claim_capacity_ok() (plus small
          * high-priority bypass and overdue-preempted exemption). */
         size_t cpos = 0;
-        int32_t claimant = find_claimant(&cpos);
+        int32_t claimant = overdue_forced ? -1 : find_claimant(&cpos);
         bool lindsay = claimant >= 0;
         if (lindsay) {
             SchedReq& cs = *reqs_[(size_t)claimant];
@@ -2849,7 +2872,8 @@ const RadBatch* Scheduler::step() {
             if (claimant >= 0 && slot != claimant) {
                 const SchedReq& cs = *reqs_[(size_t)claimant];
                 const bool overdue_pre =
-                    s.req->state == ReqState::Preempted && preempt_wait_overdue(s);
+                    s.req->state == ReqState::Preempted && preempt_wait_overdue(s) &&
+                    ahead_of(slot, claimant);
                 const bool small_hipri =
                     s.req->priority > cs.req->priority && s.seq_len() <= kHighPriBypassTokens;
                 if (!overdue_pre && !small_hipri && !claim_capacity_ok(cs, s)) {
@@ -2891,7 +2915,15 @@ const RadBatch* Scheduler::step() {
              * waited. */
             if (as == kAdmitWait) {
                 s.wait_why = kWaitKvRoom;
-                if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) {
+                    /* Hard-break when no capacity-gated claimant is active or when the overdue
+                     * loop just forced a victim off for this waiter (so the victim cannot jump
+                     * straight back in). Otherwise, under an active claimant, let smaller
+                     * capacity-safe waiters line-jump into the idle room. */
+                    if (claimant < 0 || overdue_forced) break;
+                    ++at;
+                    continue;
+                }
                 /* A fresh prompt waiting for room holds the queue behind it: shorter requests
                  * admitted past it would keep taking the room it waits for, and nothing ages a
                  * waiting fresh request the way an overdue preempted one is aged. */

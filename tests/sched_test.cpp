@@ -2510,6 +2510,96 @@ TEST(claimant_reclaim_does_not_read_stale_took_from_prior_step) {
     CHECK_EQ(f.sch.metrics().preemptions, 0);
 }
 
+/* Regression (Screenshot 2): preempted_can_prefill() must ignore RAD_KV_WINDOW groups (e.g. a
+ * drafter's rolling window), otherwise a running long sequence's (goal - held) phantom window
+ * demand blocks even tiny preempted requests from ever re-entering while anything runs. */
+TEST(preempted_prefill_ignores_windowed_kv_group) {
+    Fixture f;
+    f.build(/*blocks=*/200, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096,
+            /*linear=*/true, /*windowed=*/true);
+    const size_t wg = f.prog.kv_groups.size() - 1;
+    REQUIRE_EQ((int)f.prog.kv_groups[wg].decl.kind, (int)RAD_KV_WINDOW);
+    f.pc.groups = { 1 };   /* full-attention group only */
+    f.cfg.admit_kv_reserve = 64;
+    f.cfg.preempt_wait_ms = 50;
+    CHECK_OK(f.start());
+
+    /* Start a running 1600-token (100-block) sequence and a tiny 64-token (4-block) sequence. */
+    const uint64_t a = f.submit(1600, 100, /*priority=*/5);
+    const uint64_t tiny = f.submit(64, 32, /*priority=*/0);
+    for (int i = 0; i < 10 && (f.sch.find(a)->n_computed < 1600 || f.sch.find(tiny)->n_computed < 64); ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    REQUIRE_EQ((int)f.sch.find(tiny)->state, (int)ReqState::Running);
+
+    /* Force-preempt `tiny` so `a` stays running and `tiny` is Preempted. Then simulate a real
+     * recycled RAD_KV_WINDOW pool: `a` holds only 4 window blocks (while n_computed=1600 -> 100
+     * rows) and only 10 window blocks remain free (enough for `tiny`'s 4 blocks, far below the
+     * 96 phantom rows-held blocks of `a`). */
+    const Request* tiny_r = f.sch.find(tiny);
+    CHECK_EQ(f.sch.preempt_until([&] { return tiny_r->state == ReqState::Preempted; }), 1);
+    REQUIRE_EQ((int)f.sch.find(tiny)->state, (int)ReqState::Preempted);
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    f.kv.seqs[a].blocks[wg].resize(4);
+    if (f.kv.freelist[wg].size() > 10) f.kv.freelist[wg].resize(10);
+
+    /* On the very next step, `tiny` (4 blocks) must re-enter alongside `a` (100/200 full blocks),
+     * NOT get stuck in kAdmitWait because of `a`'s 96 phantom window blocks vs 10 free window blocks. */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(tiny)->state, (int)ReqState::Running);
+}
+
+/* Regression (Screenshot 1): an overdue Preempted big waiter that cannot force-preempt an earlier
+ * running request becomes the capacity line-jump claimant instead of hard-breaking the admission
+ * walk, so small requests behind it immediately use the idle KV room without delaying it. */
+TEST(overdue_preempted_claimant_lets_small_fitters_line_jump) {
+    Fixture f;
+    f.build(/*blocks=*/100, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.admit_kv_reserve = 32;            /* 2 blocks */
+    f.cfg.admit_backfill_ms = 50;
+    f.cfg.preempt_wait_ms = 50;
+    f.cfg.admit_claimant = true;
+    f.cfg.admit_claimant_min_pct = 0;
+    CHECK_OK(f.start());
+
+    /* A (43 prompt + 2 res = 45 blocks) and B (53 prompt + 2 res = 55 blocks) sum to 100 <= 100,
+     * so both start. Let both decode ~20 tokens so A holds 45 blocks and B has seq_len=868 (55
+     * blocks); once B is preempted, B needs 55 + 1 headroom = 56 > 55 free beside A (and B arrived
+     * after A, so overdue cannot force-preempt A). */
+    const uint64_t a = f.submit(688, 200, /*priority=*/0);
+    const uint64_t b = f.submit(848, 200, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    for (int i = 0; i < 30 && f.sch.find(a)->state == ReqState::Running &&
+                    f.sch.find(b)->state == ReqState::Running; ++i) {
+        CHECK(f.sch.step() != nullptr);
+        f.commit_plain();
+    }
+    /* Either natural KV exhaustion already preempted B, or force-preempt B now. */
+    const Request* b_r = f.sch.find(b);
+    if (b_r->state == ReqState::Running) {
+        CHECK_EQ(f.sch.preempt_until([&] { return b_r->state == ReqState::Preempted; }), 1);
+    }
+    REQUIRE_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    REQUIRE_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+
+    /* Wait past preempt_wait_ms so B is an overdue Preempted waiter behind A. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    /* Submit tiny (64 prompt + 32 res = 6 blocks: fits beside A and doesn't delay B) and
+     * too_big (768 prompt + 32 res = 50 blocks: fits beside A, but 50 + 57 > 100 so would delay B). */
+    const uint64_t tiny    = f.submit(64, 32, /*priority=*/0);
+    const uint64_t too_big = f.submit(768, 32, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(tiny)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(too_big)->state, (int)ReqState::Waiting);
+    CHECK(f.sch.metrics().claimants_total >= 1);
+}
+
 /* With the policy on but no big waiter past its window, the walk is exactly today's: in-window
  * backfill and post-window head-of-line, no claimant ever stamped. */
 TEST(the_claimant_policy_is_inert_without_a_big_waiter) {

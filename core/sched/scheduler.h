@@ -51,6 +51,9 @@ struct SchedReq {
     int64_t  admitted_us = 0;    /* 0 until the first admission: where the queue ends, so a
                                   * prefill rate can divide by the prefill alone. ttft covers
                                   * the wait for admission (GUIDE); this excludes it. */
+    /* (local) --flex-wait-ms: when this running request's KV growth began waiting on the fleet;
+     * 0 when it is not waiting. */
+    int64_t  flex_wait_us = 0;
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
     int64_t  held_us = 0;        /* when admission first held it for KV room (--admit-kv-reserve);

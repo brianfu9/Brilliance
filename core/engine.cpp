@@ -2697,6 +2697,10 @@ void Engine::loan_tick(bool idle) {
          * every growth, and the fleet refuses growths the request itself does not need. */
         if (broker_ && !ranks_.empty() && ranks_[0]->kv.flex()) {
             const uint64_t now = rad_mono_ns();
+            /* (local) --flex-wait-ms: the fleet's room, which KVManager::available_blocks reads
+             * before any growth asks, is otherwise ticked only between unpipelined steps; a
+             * request held for the fleet behind pipelined decoders would read a stale figure. */
+            flex_room_tick(now);
             if (now - flex_decay_ns_ >= 100000000ull) {
                 flex_decay_ns_ = now;
                 const auto lk = sched_.hold();

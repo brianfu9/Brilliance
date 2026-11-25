@@ -909,6 +909,11 @@ struct Config {
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
     int64_t preempt_wait_ms = 5000;
+    /* --flex-wait-ms (local): how long a running request whose KV growth waits on the fleet (a
+     * flex cache the fleet has no room to grow yet) is held in place, while the other requests
+     * run and free blocks, before the scheduler falls back on preempting them. 0 = no wait: the
+     * old preempt-then-fail. Default 60000 ms. */
+    int64_t flex_wait_ms = 60000;
     /* --admit-kv-reserve: tokens of decode room admission keeps for every sequence. A new request
      * waits in the queue until the pool can hold its whole prompt and every running sequence's
      * remaining prompt, each plus this much output; requests behind it wait too, unless

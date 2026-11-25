@@ -10303,3 +10303,92 @@ TEST(kv_fit_gate_uses_elastic_capacity_with_flex_room) {
         CHECK_EQ((int)f.sch.metrics().running, 1);
     }
 }
+
+/* ================================================================== (local) --flex-wait-ms */
+/* A running request whose growth waits on the fleet is held in place: the other runner keeps
+ * running, nobody is preempted, admission stays shut, and when the growth comes through it runs. */
+TEST(a_growth_waiting_on_the_fleet_holds_the_request_instead_of_preempting) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(16, 64, 0, /*ignore_eos=*/true);
+    const uint64_t b = f.submit(16, 64, 0, /*ignore_eos=*/true);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    REQUIRE((int)f.sch.find(a)->state == (int)ReqState::Running);
+    REQUIRE((int)f.sch.find(b)->state == (int)ReqState::Running);
+
+    f.kv.ensure_fail_id = a;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    const uint64_t c = f.submit(16, 8);
+    for (int i = 0; i < 5; ++i) {
+        const RadBatch* bt = f.sch.step();
+        REQUIRE(bt != nullptr);                       /* B still runs */
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);   /* admission shut */
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    CHECK_EQ(f.sch.metrics().flex_waits, 1);
+    CHECK_EQ(f.sch.metrics().flex_waiting, 1);
+
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().flex_waiting, 0);
+    CHECK_EQ(f.sch.metrics().flex_wait_timeouts, 0);
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    for (int i = 0; i < 400 && f.sch.find(c)->state != ReqState::Finished; ++i) {
+        if (!f.sch.step()) break;
+        f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Finished);
+}
+
+/* Past --flex-wait-ms the shortfall is preemption's to fix, as before. */
+TEST(a_fleet_wait_that_runs_out_falls_back_on_preemption) {
+    Fixture f;
+    f.build();
+    f.cfg.flex_wait_ms = 20;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(16, 64, 0, true);
+    const uint64_t b = f.submit(16, 64, 0, true);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    f.kv.ensure_fail_id = a;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK_EQ(f.sch.metrics().preemptions, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    (void)f.sch.step();
+    CHECK_EQ(f.sch.metrics().flex_wait_timeouts, 1);
+    CHECK(f.sch.metrics().preemptions >= 1);
+    CHECK((int)f.sch.find(b)->state != (int)ReqState::Running);
+}
+
+/* A shortage the fleet cannot cover (the whole carve is in use) preempts at once, and
+ * --flex-wait-ms 0 turns the wait off. */
+TEST(a_shortage_the_fleet_cannot_cover_preempts_at_once) {
+    for (int off = 0; off < 2; ++off) {
+        Fixture f;
+        f.build();
+        if (off) f.cfg.flex_wait_ms = 0;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(16, 64, 0, true);
+        const uint64_t b = f.submit(16, 64, 0, true);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        f.kv.ensure_fail_id = a;
+        f.kv.ensure_error = RAD_E_FULL;
+        f.kv.waiting_for_fleet = off != 0;
+        (void)f.sch.step();
+        CHECK_EQ(f.sch.metrics().flex_waits, 0);
+        CHECK(f.sch.metrics().preemptions >= 1);
+        CHECK((int)f.sch.find(b)->state != (int)ReqState::Running);
+    }
+}

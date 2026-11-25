@@ -153,6 +153,10 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
         o.draft_verify_depth[d] = m.draft_verify_depth[d];
     o.preemptions = m.preemptions;
     o.preempt_forced = m.preempt_forced;
+    o.flex_waits = m.flex_waits;
+    o.flex_wait_timeouts = m.flex_wait_timeouts;
+    o.flex_wait_ms = m.flex_wait_ms;
+    o.flex_waiting = m.flex_waiting;
     o.admit_kv_held = m.admit_kv_held;
     o.claimants_total = m.claimants_total;
     o.claimant_admitted = m.claimant_admitted;

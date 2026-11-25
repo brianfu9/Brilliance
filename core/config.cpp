@@ -90,6 +90,10 @@ static const Flag g_flags[] = {
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
                                         "(default 5000) falls back on the next step" },
+    { "--flex-wait-ms",       "N",      "how long a running request whose KV growth waits on the\n"
+                                        "fleet is held, without preempting anyone, before the\n"
+                                        "shortfall is preemption's to fix; 0 = no wait\n"
+                                        "(default 60000)" },
     { "--admit-kv-reserve",   "N",      "admit a new request only when the KV pool holds its whole\n"
                                         "prompt and every running sequence's, each plus N tokens of\n"
                                         "output; it waits in the queue until then. 0 (default) admits\n"
@@ -782,6 +786,7 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
         }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
+        else if (S("--flex-wait-ms"))          { if (!num(0, INT64_MAX, &c->flex_wait_ms)) return RAD_E_INVAL; }
         else if (S("--admit-kv-reserve"))      { if (!num(0, INT64_MAX, &c->admit_kv_reserve)) return RAD_E_INVAL; }
         else if (S("--admit-backfill-ms"))     { if (!num(0, INT64_MAX, &c->admit_backfill_ms)) return RAD_E_INVAL; }
         else if (S("--admit-claimant"))        c->admit_claimant = true;
@@ -1839,6 +1844,7 @@ const ShowRow kShow[] = {
     { "--prefill-room-gate", [](const Config& c) {
           return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
+    { "--flex-wait-ms",       [](const Config& c) { return num(c.flex_wait_ms); } },
     { "--admit-backfill-ms",  [](const Config& c) {
           return c.admit_backfill_ms > 0 ? num(c.admit_backfill_ms) : std::string("off"); } },
     { "--admit-claimant",     [](const Config& c) { return onoff(c.admit_claimant); } },

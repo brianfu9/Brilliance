@@ -32,6 +32,13 @@ struct SchedMetrics {
     /* --preempt-wait-ms fallback: waits that ended by evicting cache blocks and forcing a running
      * victim, not just by the pool freeing itself. */
     int64_t preempt_forced = 0;
+    /* --flex-wait-ms (local): running requests held in place because their KV growth waited on
+     * the fleet (one count per wait), waits that ran out and fell back on preemption, the
+     * milliseconds held in waits that ended with the growth, and requests held now (a gauge). */
+    int64_t flex_waits = 0;
+    int64_t flex_wait_timeouts = 0;
+    int64_t flex_wait_ms = 0;
+    int64_t flex_waiting = 0;
     /* --admit-kv-reserve: requests admission held at least once for KV room. */
     int64_t admit_kv_held = 0;
     /* --admit-claimant: claimants first marked (a big waiter crossed its hold window), claimants

@@ -234,6 +234,10 @@ void Metrics::sample(const SchedMetrics& m) {
     c_flex_granted_.advance_to((double)m.flex_grow_granted);
     c_flex_refused_zero_.advance_to((double)m.flex_grow_refused_zero_room);
     c_flex_refused_short_.advance_to((double)m.flex_grow_refused_short_room);
+    c_flex_waits_.advance_to((double)m.flex_waits);
+    c_flex_wait_timeouts_.advance_to((double)m.flex_wait_timeouts);
+    c_flex_wait_ms_.advance_to((double)m.flex_wait_ms);
+    g_flex_waiting_.set((double)m.flex_waiting);
     c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
     g_linear_hit_.set(m.linear_hit_rate);
 }
@@ -336,6 +340,17 @@ std::string Metrics::render() const {
     w.counter("radiance:flex_grow_refused_short_room_total",
               "KV cache growths the fleet refused with less room than the shortfall (local).",
               L, c_flex_refused_short_.get());
+    w.counter("radiance:flex_waits_total",
+              "Running requests held in place while their KV growth waited on the fleet "
+              "(--flex-wait-ms) (local).", L, c_flex_waits_.get());
+    w.counter("radiance:flex_wait_timeouts_total",
+              "Fleet waits that ran out and fell back on preemption (local).",
+              L, c_flex_wait_timeouts_.get());
+    w.counter("radiance:flex_wait_ms_total",
+              "Milliseconds held in fleet waits that ended with the growth (local).",
+              L, c_flex_wait_ms_.get());
+    w.gauge("radiance:flex_waiting",
+            "Running requests held for the fleet now (local).", L, g_flex_waiting_.get());
     /* Labelled by direction; the resolve only copies in. */
     w.help("radiance:kv_stream_bytes_total",
            "Bytes a streamed KV group's resolve moved, by direction.", "counter");

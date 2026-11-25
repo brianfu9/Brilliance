@@ -142,6 +142,11 @@ struct SchedMetrics {
     int64_t draft_verify_depth[MAX_DRAFT_POS + 1] = {};
     int64_t preemptions = 0;
     int64_t preempt_forced = 0;       /* --preempt-wait-ms fallback victims */
+    /* (local) --flex-wait-ms: growths held for the fleet, waits that ran out, ms held, held now. */
+    int64_t flex_waits = 0;
+    int64_t flex_wait_timeouts = 0;
+    int64_t flex_wait_ms = 0;
+    int64_t flex_waiting = 0;
     int64_t admit_kv_held = 0;        /* --admit-kv-reserve: requests held for KV room */
     /* --admit-claimant: claimants stamped and admitted, fillers refused by the anchor gate. */
     int64_t claimants_total = 0;

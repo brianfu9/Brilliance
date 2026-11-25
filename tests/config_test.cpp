@@ -614,6 +614,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--mixed-step-target-ms", { "150" } },
         { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
+        { "--flex-wait-ms", { "60000" } },
         { "--admit-kv-reserve", { "16384" } },
         { "--admit-backfill-ms", { "60000" } },
         { "--admit-claimant-min-pct", { "25" } },

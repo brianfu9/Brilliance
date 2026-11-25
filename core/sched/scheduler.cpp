@@ -1588,6 +1588,7 @@ bool Scheduler::preempt_back() {
     r.n_accepted = 0;
     r.state = ReqState::Preempted;
     s.preempted_us = mono_us();
+    s.flex_wait_us = 0;
     server::sink_preempted(r.sink);
     s.drafter_reset();
     /* Also clear the request's own window. The sampler stages 1 + Request::n_draft rows
@@ -2416,6 +2417,7 @@ const RadBatch* Scheduler::step() {
 
     int64_t budget = cfg_.max_tok;
     bool preempted_here = false;
+    bool flex_held = false;   /* (local) a running request waits for the fleet this step */
     /* --prefill-interleave: after a step that carried a chunk beside decoding sequences, with the
      * prompt continuing, the next N steps carry decode rows only and admit nothing. With nothing
      * decoding there is nothing to give steps to, and the hold is dropped. */
@@ -2673,14 +2675,44 @@ const RadBatch* Scheduler::step() {
          * that would be re-admitted last anyway. Reclaiming from the cache is tried first, but
          * only kEvictRounds times; past that the shortfall is preemption's to fix. */
         int evict_rounds = 0;
-        bool failed = false, yielded = false;
-        while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
+        bool failed = false, yielded = false, held = false;
+        /* (local) Set by the KV manager when the shortfall is one the fleet could cover: a flex
+         * cache whose whole carve holds the growth, short only of what the fleet can back now. */
+        bool fleet_short = false;
+        while (kv_->ensure_admission(r.id, r.n_computed + want, r.n_computed, &fleet_short) < 0) {
             /* The cache gives blocks back before a running request does: a cached prefix saves
              * work done once, a running request is work in flight. Nothing else releases the
              * cache's references, so this also keeps publishing from leaking. */
             if (++evict_rounds <= kEvictRounds && pc_ && cfg_.prefix_cache &&
                 pc_->evict(kEvictBlocks) > 0)
                 continue;
+            /* (local) --flex-wait-ms: a growth the fleet could back later waits in place. The
+             * other running requests keep running and their blocks come back as they finish, and
+             * the fleet's room can grow; preempting them instead throws their work away and,
+             * once this request runs alone, fails it with room it could have had. Past the wait
+             * the shortfall is preemption's to fix, as before (flex_wait_us < 0 until the growth
+             * is met or the request leaves the running set). */
+            if (fleet_short && cfg_.flex_wait_ms > 0 && s.flex_wait_us >= 0) {
+                const int64_t now = mono_us();
+                if (s.flex_wait_us == 0) {
+                    s.flex_wait_us = now;
+                    ++m_.flex_waits;
+                    RAD_INFO("request %llu waits for the fleet to grow the KV cache to %lld tokens "
+                             "(up to %lld ms) instead of preempting",
+                             (unsigned long long)r.id, (long long)(r.n_computed + want),
+                             (long long)cfg_.flex_wait_ms);
+                }
+                if (now - s.flex_wait_us < cfg_.flex_wait_ms * 1000) {
+                    held = true;
+                    break;
+                }
+                ++m_.flex_wait_timeouts;
+                RAD_WARN("request %llu waited %lld ms for the fleet to grow the KV cache to %lld "
+                         "tokens; preempting instead",
+                         (unsigned long long)r.id, (long long)((now - s.flex_wait_us) / 1000),
+                         (long long)(r.n_computed + want));
+                s.flex_wait_us = -1;
+            }
             const bool last = running_.size() - 1 <= i;
             if (!kv_->can_ever_fit(r.n_computed + want) || (last && i == 0)) {
                 /* §17: either no pool could serve this length, or the request runs alone and
@@ -2709,8 +2741,25 @@ const RadBatch* Scheduler::step() {
          * or none. */
         if (failed || yielded) {
             if (capped_at == (int32_t)plan_.e.size()) capped_at = -1;
+            s.flex_wait_us = 0;
             continue;
         }
+        /* (local) Held for the fleet: it keeps its blocks and its place, takes nothing this step,
+         * and admission stays shut so the blocks the others free come to it. A decode row's
+         * draft for this step is dropped; the next step proposes again. */
+        if (held) {
+            if (!prefill) { s.n_draft = 0; s.draft_ngram = false; s.draft_suffix = false; }
+            flex_held = true;
+            ++i;
+            continue;
+        }
+        if (s.flex_wait_us > 0) {
+            const int64_t waited_ms = (mono_us() - s.flex_wait_us) / 1000;
+            m_.flex_wait_ms += waited_ms;
+            RAD_INFO("request %llu: the KV cache grew after %lld ms of waiting",
+                     (unsigned long long)r.id, (long long)waited_ms);
+        }
+        s.flex_wait_us = 0;
 
         StepEntry e;
         e.req = &r;
@@ -2769,7 +2818,12 @@ const RadBatch* Scheduler::step() {
     /* ---------------------------------------------------------- admission */
     /* Skipped in a step that preempted: the pool just refused a request that already had blocks,
      * so it would refuse a new one, and the queue's front is now the preempted request. */
-    if (!preempted_here && !hold_prefill) {
+    {
+        int64_t n_waiting = 0;
+        for (int32_t slot : running_) if (reqs_[(size_t)slot]->flex_wait_us > 0) ++n_waiting;
+        m_.flex_waiting = n_waiting;
+    }
+    if (!preempted_here && !hold_prefill && !flex_held) {
         /* `at` walks the queue and `took_` is what it admitted: a request whose media is not
          * encoded yet stays where it is and the one behind it is asked, so the queue is compacted
          * after the walk rather than cut at its front. */

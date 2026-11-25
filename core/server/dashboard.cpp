@@ -448,6 +448,11 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["flex_grow_granted"]    = m.flex_grow_granted;
         o["flex_grow_refused"]    = { { "zero_room", m.flex_grow_refused_zero_room },
                                       { "short_room", m.flex_grow_refused_short_room } };
+        /* (local) --flex-wait-ms: running requests held for the fleet instead of preempting. */
+        o["flex_wait"]            = { { "waits", m.flex_waits },
+                                      { "timeouts", m.flex_wait_timeouts },
+                                      { "ms", m.flex_wait_ms },
+                                      { "waiting", m.flex_waiting } };
         o["prefix_hit_rate"] = m.prefix_hit_rate;
         /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
          * starts dropping prefixes the next turn wants. */

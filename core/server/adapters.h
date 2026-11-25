@@ -93,6 +93,11 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     /* KV streaming's totals are not per group, so they pass through. */
     o.kv_resident_blocks = m.kv_resident_blocks;
     o.kv_stream_misses = m.kv_stream_misses;
+    o.kv_short_peak_blocks = m.kv_short_peak_blocks;
+    o.kv_loan_tokens = m.kv_loan_tokens;
+    o.flex_grow_granted = m.flex_grow_granted;
+    o.flex_grow_refused_zero_room = m.flex_grow_refused_zero_room;
+    o.flex_grow_refused_short_room = m.flex_grow_refused_short_room;
     o.kv_stream_bytes_in = m.kv_stream_bytes_in;
 
     /* vLLM's gpu_prefix_cache_hit_rate means attention caching. The linear-checkpoint hit

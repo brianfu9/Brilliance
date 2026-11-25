@@ -491,6 +491,19 @@ public:
     int64_t spare_tokens();
     /* Read-only view of spare_tokens() without decaying short_peak_: safe inside predicate loops. */
     int64_t spare_tokens_peek() const;
+    /* (local) One decay step of the shortfall peak (1/8). spare_tokens() calls it on a lending
+     * cache; a flex cache has no lending arbiter, so Engine::loan_tick calls it every 100 ms, under
+     * the scheduler's lock. Without it a flex cache keeps its largest shortfall as its buffer for
+     * the life of the process, and every later growth asks the fleet for that much again. */
+    void    decay_short_peak();
+    /* (local) Flex growth counters for /stats and /metrics. Rank 0. */
+    struct FlexGrowStats {
+        int64_t short_peak_blocks  = 0;   /* the largest group's current peak */
+        int64_t granted            = 0;   /* growths the fleet granted */
+        int64_t refused_zero_room  = 0;   /* refused while the fleet reported no room at all */
+        int64_t refused_short_room = 0;   /* refused with some room, less than even the shortfall */
+    };
+    FlexGrowStats flex_grow_stats() const;
 
     /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
      * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
@@ -805,6 +818,9 @@ private:
     int64_t  flex_backed_ = 0;              /* set_flex: the bytes the carve backs at start */
     int64_t  flex_floor_loan_ = 0;          /* the loan the carve started at */
     int64_t  flex_room_ = 0;                /* set_flex_room */
+    /* (local) flex_grow_stats() and the rate limit of the refusal log line. */
+    int64_t  flex_granted_ = 0, flex_refused_zero_ = 0, flex_refused_short_ = 0;
+    int64_t  flex_refuse_log_ns_ = 0;
     /* Backs (or unbacks) every lendable group's stripes between the live marks of two loans. */
     int      flex_span(int64_t lo_loan, int64_t hi_loan, bool back);
     uint64_t seq_frees_ = 0;

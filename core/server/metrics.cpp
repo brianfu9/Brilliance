@@ -229,6 +229,11 @@ void Metrics::sample(const SchedMetrics& m) {
     c_restore_cuts_.advance_to(m.prefix_restore_cuts);
     c_cut_tokens_.advance_to(m.hit_cut_tokens);
     c_kv_stream_misses_.advance_to((double)m.kv_stream_misses);
+    g_kv_short_peak_.set((double)m.kv_short_peak_blocks);
+    g_kv_loan_tokens_.set((double)m.kv_loan_tokens);
+    c_flex_granted_.advance_to((double)m.flex_grow_granted);
+    c_flex_refused_zero_.advance_to((double)m.flex_grow_refused_zero_room);
+    c_flex_refused_short_.advance_to((double)m.flex_grow_refused_short_room);
     c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
     g_linear_hit_.set(m.linear_hit_rate);
 }
@@ -317,6 +322,20 @@ std::string Metrics::render() const {
     w.counter("radiance:kv_stream_misses_total",
               "Blocks copied into a streamed KV group's ring from the host mirror.",
               L, c_kv_stream_misses_.get());
+    w.gauge("radiance:kv_short_peak_blocks",
+            "The KV growth buffer: the largest recent shortfall, decaying (local).",
+            L, g_kv_short_peak_.get());
+    w.gauge("radiance:kv_loan_tokens",
+            "Tokens of the KV carve still lent (a flex cache: not backed by VRAM) (local).",
+            L, g_kv_loan_tokens_.get());
+    w.counter("radiance:flex_grow_granted_total",
+              "KV cache growths the fleet granted (local).", L, c_flex_granted_.get());
+    w.counter("radiance:flex_grow_refused_zero_room_total",
+              "KV cache growths the fleet refused while it reported no room (local).",
+              L, c_flex_refused_zero_.get());
+    w.counter("radiance:flex_grow_refused_short_room_total",
+              "KV cache growths the fleet refused with less room than the shortfall (local).",
+              L, c_flex_refused_short_.get());
     /* Labelled by direction; the resolve only copies in. */
     w.help("radiance:kv_stream_bytes_total",
            "Bytes a streamed KV group's resolve moved, by direction.", "counter");

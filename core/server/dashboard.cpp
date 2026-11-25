@@ -442,6 +442,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["kv_bytes_total"]  = (double)m.kv_bytes_total;
         o["kv_bytes_carved"] = (double)m.kv_bytes_carved;
         o["kv_tokens_max"]   = m.kv_tokens_max;
+        /* (local) Flex growth: buffer, unbacked loan, and the fleet's answers. */
+        o["kv_short_peak_blocks"] = m.kv_short_peak_blocks;
+        o["kv_loan_tokens"]       = m.kv_loan_tokens;
+        o["flex_grow_granted"]    = m.flex_grow_granted;
+        o["flex_grow_refused"]    = { { "zero_room", m.flex_grow_refused_zero_room },
+                                      { "short_room", m.flex_grow_refused_short_room } };
         o["prefix_hit_rate"] = m.prefix_hit_rate;
         /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
          * starts dropping prefixes the next turn wants. */

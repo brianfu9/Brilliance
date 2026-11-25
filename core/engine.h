@@ -925,6 +925,7 @@ private:
     void loan_tick(bool idle);
     bool     lending_ = false;
     uint64_t loan_last_ns_ = 0;
+    uint64_t flex_decay_ns_ = 0;   /* (local) loan_tick's flex branch: the shortfall peak's decay */
     /* The activation arena's loan (Engine::arena_step). `arena_rows_[k]` is the largest step Ctx
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a

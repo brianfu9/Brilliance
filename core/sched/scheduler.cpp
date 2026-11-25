@@ -4510,6 +4510,14 @@ SchedMetrics Scheduler::metrics_locked() const {
     /* Zero on a server whose groups are all resident. */
     m.kv_resident_blocks = kv_->stream_resident_blocks();
     m.kv_stream_misses   = kv_->stream_misses();
+    {
+        const auto ff = kv_->flex_figures();
+        m.kv_short_peak_blocks = ff.short_peak_blocks;
+        m.kv_loan_tokens = ff.loan_tokens;
+        m.flex_grow_granted = ff.granted;
+        m.flex_grow_refused_zero_room = ff.refused_zero_room;
+        m.flex_grow_refused_short_room = ff.refused_short_room;
+    }
     m.kv_stream_bytes_in = kv_->stream_bytes_in();
 
     if (pc_) { m.prefix_evictions = pc_->evictions();

@@ -103,6 +103,13 @@ struct SchedMetrics {
     int64_t kv_resident_blocks = 0;
     int64_t kv_stream_misses = 0;
     int64_t kv_stream_bytes_in = 0;
+    /* (local) Flex growth: the shortfall peak (the growth buffer), the tokens still lent to the
+     * fleet (the unbacked part of the carve), and the fleet's grants and refusals so far. */
+    int64_t kv_short_peak_blocks = 0;
+    int64_t kv_loan_tokens = 0;
+    int64_t flex_grow_granted = 0;
+    int64_t flex_grow_refused_zero_room = 0;
+    int64_t flex_grow_refused_short_room = 0;
 
     /* Prefix caching (§7.3). Attention and linear are reported separately because they hit at
      * different granularities. */

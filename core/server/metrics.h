@@ -119,6 +119,9 @@ private:
     Gauge   g_kv_max_tokens_, g_kv_max_bytes_, g_kv_resident_blocks_;
     /* KV streaming: blocks and bytes copied into the rings, cumulative. */
     Counter c_kv_stream_misses_, c_kv_stream_bytes_;
+    /* (local) Flex growth. */
+    Gauge   g_kv_short_peak_, g_kv_loan_tokens_;
+    Counter c_flex_granted_, c_flex_refused_zero_, c_flex_refused_short_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     /* The decode floor in seconds: the fastest and the most recent single-sequence window. 0
      * until a window completes, and render() omits a 0. */

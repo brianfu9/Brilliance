@@ -6,6 +6,7 @@
 #include "device/device.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cassert>
 #include <cstring>
@@ -942,20 +943,48 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
     const int64_t short_by = blocks - free_usable_[(size_t)g];
     if (short_by <= 0) return RAD_OK;
 
-    /* Record the shortfall, not the recall (see short_peak_ in kv.h). */
-    if ((size_t)g < short_peak_.size() && short_by > short_peak_[(size_t)g])
-        short_peak_[(size_t)g] = short_by;
-
     if (!lendable(g) || loan_ <= 0 || live_[(size_t)g] >= p.n_blocks) return RAD_E_FULL;
-    int64_t live = live_[(size_t)g] + short_by + buf_blocks((size_t)g);
-    if (live > p.n_blocks) live = p.n_blocks;
-    /* The loan, in tokens, that leaves this group `live` blocks. It only shrinks: a shortfall in
-     * one group never lends more of another. */
-    int64_t keep = (p.n_blocks - live) * p.block_size;
-    if (keep > loan_) keep = loan_;
+    /* The loan, in tokens, that leaves this group the shortfall plus `extra` more live blocks. It
+     * only shrinks: a shortfall in one group never lends more of another. */
+    const auto keep_for = [&](int64_t extra) {
+        int64_t live = live_[(size_t)g] + short_by + extra;
+        if (live > p.n_blocks) live = p.n_blocks;
+        int64_t k = (p.n_blocks - live) * p.block_size;
+        return k > loan_ ? loan_ : k;
+    };
+    int64_t keep = keep_for(buf_blocks((size_t)g));
     if (reclaim_) {
-        const int rc = reclaim_(keep, waiting_for_fleet);
-        if (rc == RAD_E_FULL) return rc;   /* a flex cache the fleet could not grow: the request waits */
+        int rc = reclaim_(keep, waiting_for_fleet);
+        /* (local) A flex cache the fleet will not grow by the shortfall plus the buffer asks again
+         * for the shortfall alone: the buffer only saves a recall per block, and a request refused
+         * for it would wait (or be failed) for room it does not need. */
+        int64_t asked = keep;
+        if (rc == RAD_E_FULL && flex()) {
+            const int64_t keep_min = keep_for(0);
+            if (keep_min > keep) {
+                if (waiting_for_fleet) *waiting_for_fleet = false;
+                keep = keep_min;
+                rc = reclaim_(keep, waiting_for_fleet);
+            }
+        }
+        if (rc == RAD_E_FULL) {   /* a flex cache the fleet could not grow: the request waits */
+            if (flex()) {
+                (flex_room_ <= 0 ? flex_refused_zero_ : flex_refused_short_) += 1;
+                const int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (now - flex_refuse_log_ns_ >= 10000000000ll) {
+                    flex_refuse_log_ns_ = now;
+                    RAD_INFO("KV group '%s': the fleet refused to grow the cache: short %lld blocks, "
+                             "buffer %lld blocks, asked %lld then %lld tokens of %lld lent, fleet room "
+                             "%lld tokens (refused %lld with no room, %lld with too little so far)",
+                             p.name.c_str(), (long long)short_by, (long long)buf_blocks((size_t)g),
+                             (long long)(loan_ - asked), (long long)(loan_ - keep), (long long)loan_,
+                             (long long)flex_room_, (long long)flex_refused_zero_,
+                             (long long)flex_refused_short_);
+                }
+            }
+            return rc;
+        }
         if (rc < 0) {
             RAD_ERR("KV group '%s': a request needs %lld more blocks and the expert slab could not "
                     "give back the loan past %lld tokens: %s", p.name.c_str(),
@@ -964,15 +993,34 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
         }
     }
     RAD_TRY(set_loan(keep));
+    if (flex()) ++flex_granted_;
+    /* Record the shortfall, not the recall (see short_peak_ in kv.h); and only a met one (local):
+     * a refused request retries every step, and recording its shortfall each time would keep the
+     * peak from decaying while it waits. */
+    if ((size_t)g < short_peak_.size() && short_by > short_peak_[(size_t)g])
+        short_peak_[(size_t)g] = short_by;
     return free_usable_[(size_t)g] >= blocks ? RAD_OK : RAD_E_FULL;
 }
 
-int64_t KVManager::spare_tokens() {
+void KVManager::decay_short_peak() {
     for (size_t i = 0; i < plans_.size(); ++i) {
         /* Decay the shortfall peak by 1/8 a tick (a half-life of about half a second), so one
          * large admission does not pin its size of buffer for the life of the process. */
         if (i < short_peak_.size()) short_peak_[i] -= short_peak_[i] / 8;
     }
+}
+
+KVManager::FlexGrowStats KVManager::flex_grow_stats() const {
+    FlexGrowStats s;
+    for (int64_t v : short_peak_) s.short_peak_blocks = std::max(s.short_peak_blocks, v);
+    s.granted = flex_granted_;
+    s.refused_zero_room = flex_refused_zero_;
+    s.refused_short_room = flex_refused_short_;
+    return s;
+}
+
+int64_t KVManager::spare_tokens() {
+    decay_short_peak();
     return spare_tokens_peek();
 }
 

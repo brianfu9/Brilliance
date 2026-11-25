@@ -68,6 +68,12 @@ struct SchedMetrics {
     int64_t kv_resident_blocks = 0;
     int64_t kv_stream_misses = 0;
     int64_t kv_stream_bytes_in = 0;
+    /* (local) Flex growth, from the scheduler's metrics. */
+    int64_t kv_short_peak_blocks = 0;
+    int64_t kv_loan_tokens = 0;
+    int64_t flex_grow_granted = 0;
+    int64_t flex_grow_refused_zero_room = 0;
+    int64_t flex_grow_refused_short_room = 0;
 
     double  prefix_hit_rate = 0.0;    /* 0..1 */
     /* Cumulative prefix-cache evictions. They rise as reusable prefixes are dropped, while

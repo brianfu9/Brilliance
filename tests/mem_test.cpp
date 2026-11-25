@@ -8802,3 +8802,87 @@ TEST(a_streamed_op_exists_only_for_a_capable_architecture_and_a_ring) {
     CHECK(!kvstream_op_gated(ctx, "kv_store"));
     CHECK(!kvstream_op_gated(ctx, "attn_paged"));
 }
+
+/* (local) Flex growth buffer (investigation 2026-11-25, qwen27b compaction refused at 215,040 tokens).
+ * A flex cache has no lending arbiter, so nothing called spare_tokens() and the shortfall peak never
+ * decayed: after one large shortfall every growth asked the fleet for that much again and was refused. */
+namespace {
+struct FlexRig {
+    Lender  e;
+    int64_t room_blocks = 0, last_growth = -1, all = 0;
+    int     calls = 0;
+    int setup() {
+        int s = e.build(); if (s < 0) return s;
+        all = e.kv.total_blocks(G_FULL);
+        e.kv.set_flex(1);
+        s = e.kv.set_loan(e.kv.spare_tokens_peek()); if (s < 0) return s;
+        e.kv.set_fleet_reclaim([this](int64_t keep, bool* pending) {
+            ++calls;
+            last_growth = (e.kv.loan_tokens() - keep) / e.bs();
+            if (last_growth > room_blocks) { if (pending) *pending = true; return (int)RAD_E_FULL; }
+            return (int)RAD_OK;
+        });
+        return RAD_OK;
+    }
+    void room(int64_t blocks) { room_blocks = blocks; e.kv.set_flex_room(blocks * e.bs()); }
+    /* One big shortfall the fleet grants in full; then the grown part goes back to the fleet. */
+    int big_then_release() {
+        room(all);
+        const int64_t idle = e.kv.live_blocks(G_FULL);
+        if (e.kv.add_sequence(1) < 0) return RAD_E_INVAL;
+        const int rc = e.kv.ensure(1, (idle + all) / 2 * e.bs());
+        e.kv.free_sequence(1);
+        if (rc < 0) return rc;
+        return e.kv.set_loan(e.kv.spare_tokens_peek());
+    }
+    int past_live(uint64_t id, int64_t blocks, bool* waiting = nullptr) {
+        last_growth = -1; calls = 0;
+        if (e.kv.add_sequence(id) < 0) return RAD_E_INVAL;
+        return e.kv.ensure(id, (e.kv.live_blocks(G_FULL) + blocks) * e.bs(), -1, waiting);
+    }
+};
+}
+
+TEST(flex_growth_asks_for_the_shortfall_when_the_buffered_ask_is_refused) {
+    FlexRig r; REQUIRE_EQ(r.setup(), RAD_OK);
+    REQUIRE_EQ(r.big_then_release(), RAD_OK);
+    CHECK(r.e.kv.flex_grow_stats().short_peak_blocks > r.all / 4);   /* the buffer is large */
+    r.room(r.all / 8);                                                 /* less than the buffer */
+    CHECK_OK(r.past_live(2, 4));                                       /* was RAD_E_FULL */
+    CHECK_EQ(r.calls, 2);                                              /* buffered, then the need */
+    CHECK(r.last_growth <= 4);
+    CHECK(r.e.kv.flex_grow_stats().granted >= 2);
+}
+
+TEST(flex_growth_refused_even_for_the_shortfall_waits_and_does_not_raise_the_peak) {
+    FlexRig r; REQUIRE_EQ(r.setup(), RAD_OK);
+    REQUIRE_EQ(r.big_then_release(), RAD_OK);
+    for (int i = 0; i < 200; ++i) r.e.kv.decay_short_peak();
+    const int64_t peak = r.e.kv.flex_grow_stats().short_peak_blocks;
+    /* The ticked room says it fits; the fleet's grant then says no (a load started in between). */
+    r.room(r.all / 8);
+    r.room_blocks = 16;
+    bool waiting = false;
+    CHECK_EQ(r.past_live(2, 1024, &waiting), RAD_E_FULL);
+    CHECK(waiting);
+    CHECK_EQ(r.e.kv.flex_grow_stats().short_peak_blocks, peak);        /* refusal not recorded */
+    CHECK_EQ(r.e.kv.flex_grow_stats().refused_short_room, 1);
+    r.room(0);
+    r.e.kv.free_sequence(2);
+    CHECK_EQ(r.past_live(3, 1024, &waiting), RAD_E_FULL);              /* no room: early refusal */
+}
+
+TEST(flex_short_peak_decays_without_a_lending_arbiter) {
+    FlexRig r; REQUIRE_EQ(r.setup(), RAD_OK);
+    REQUIRE_EQ(r.big_then_release(), RAD_OK);
+    const int64_t peak = r.e.kv.flex_grow_stats().short_peak_blocks;
+    CHECK(peak > 0);
+    for (int i = 0; i < 64; ++i) r.e.kv.decay_short_peak();
+    CHECK(r.e.kv.flex_grow_stats().short_peak_blocks < peak / 1000 + 8);
+    /* With the buffer gone, a small growth asks for about one chunk, in one call. */
+    CHECK_OK(r.e.kv.set_loan(r.e.kv.spare_tokens_peek()));
+    r.room(r.all / 8);
+    CHECK_OK(r.past_live(2, 4));
+    CHECK_EQ(r.calls, 1);
+    CHECK(r.last_growth <= 4 + 256);
+}

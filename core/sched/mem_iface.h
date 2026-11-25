@@ -142,6 +142,13 @@ struct IKVManager {
     /* The resolve's cumulative traffic and the rings' depth, for the metrics; zero without
      * streaming. */
     virtual int64_t  stream_misses() const { return 0; }
+    /* (local) Flex growth figures (KVManager::flex_grow_stats, loan); zero without flex. */
+    struct FlexFigures {
+        int64_t short_peak_blocks = 0, loan_tokens = 0, granted = 0, refused_zero_room = 0,
+                refused_short_room = 0;
+        bool    flex = false;
+    };
+    virtual FlexFigures flex_figures() const { return {}; }
     virtual int64_t  stream_bytes_in() const { return 0; }
     virtual int64_t  stream_resident_blocks() const { return 0; }
 
@@ -484,6 +491,17 @@ struct KVBinding final : IKVManager {
     int64_t pool_bytes_carved(int32_t g) const override { return m->pool_bytes_carved(g); }
     const RadKVStream* stream_view(int32_t g) const override { return m->stream_view(g); }
     int64_t stream_misses() const override { return (int64_t)m->stream_stats().misses; }
+    FlexFigures flex_figures() const override {
+        FlexFigures f;
+        const auto s = m->flex_grow_stats();
+        f.short_peak_blocks = s.short_peak_blocks;
+        f.loan_tokens = m->loan_tokens();
+        f.granted = s.granted;
+        f.refused_zero_room = s.refused_zero_room;
+        f.refused_short_room = s.refused_short_room;
+        f.flex = m->flex();
+        return f;
+    }
     int64_t stream_bytes_in() const override { return (int64_t)m->stream_stats().bytes_in; }
     int64_t stream_resident_blocks() const override {
         return m->stream_stats().resident_blocks;

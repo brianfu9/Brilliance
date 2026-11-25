@@ -2689,7 +2689,22 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
  * A request that cannot wait for a shrink takes the blocks at once through a callback into every
  * slab (KVManager::set_reclaim, installed in start()). */
 void Engine::loan_tick(bool idle) {
-    if (!lending_) return;
+    if (!lending_) {
+        /* (local) A flex cache has no lending arbiter, and the arbiter's spare_tokens() is what
+         * decays the shortfall peak. Decay it here on the same 100 ms clock, after every step and
+         * while idle, under the scheduler's lock (flex_service and the prefix cache read the
+         * buffer under it). Without this the largest shortfall since start stays the buffer of
+         * every growth, and the fleet refuses growths the request itself does not need. */
+        if (broker_ && !ranks_.empty() && ranks_[0]->kv.flex()) {
+            const uint64_t now = rad_mono_ns();
+            if (now - flex_decay_ns_ >= 100000000ull) {
+                flex_decay_ns_ = now;
+                const auto lk = sched_.hold();
+                ranks_[0]->kv.decay_short_peak();
+            }
+        }
+        return;
+    }
     const uint64_t now = rad_mono_ns();
     if (now - loan_last_ns_ < 100000000ull) return;    /* 100 ms */
     loan_last_ns_ = now;

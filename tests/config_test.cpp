@@ -657,6 +657,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--allow-host", { "box" } },
         { "--trusted-proxy", { "127.0.0.0/8" } },
         { "--served-model-name", { "m" } }, { "--mm-max-patches", { "1024" } },
+        { "--mm-audio-frames", { "1664" } },
         { "--terms-file", { "/t/terms.md" } },
         { "--control-vector", { "off" } },
         { "--control-vector-variant", { "uncensored", "--control-vector", "off" } },

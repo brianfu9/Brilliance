@@ -358,6 +358,9 @@ static const Flag g_flags[] = {
                                         "pixels). Default `auto`: 16384 when the container carries a vision tower (0 in a build\n"
                                         "without a media decoder, which would refuse every media part). 0 serves text\n"
                                         "only and keeps the tower off the card" },
+    { "--mm-audio-frames",    "N",      "mel frames one audio encoder pass carries (Qwen3-ASR: 104 frames/s). Default\n"
+                                        "auto: the model's pass (3120 = 30 s). Must satisfy 104 <= N and N % 8 == 0;\n"
+                                        "0 disables audio" },
     { "--image-gen-max-pixels", "N",    "an image generator's largest image, in pixels (1048576: 1024 x 1024).\n"
       "                              Default: the model's. Its per-image buffers, and the activation\n"
       "                              arena with them, are sized for it; larger requests are refused" },
@@ -1254,6 +1257,11 @@ int config_parse(int argc, char** argv, Config* c) {
             if (!std::strcmp(v, "auto")) c->mm_max_patches = -1;
             else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->mm_max_patches)) return RAD_E_INVAL;
         }
+        else if (S("--mm-audio-frames")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) c->mm_audio_frames = -1;
+            else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->mm_audio_frames)) return RAD_E_INVAL;
+        }
         else if (S("--reasoning-effort"))      { if (!(v = need(i))) return RAD_E_INVAL;
                                                  c->reasoning_effort = v; }
         else if (S("--reasoning-effort-map"))  {
@@ -1950,6 +1958,7 @@ const ShowRow kShow[] = {
     { "--terms-file",         [](const Config& c) { return or_none(c.terms_file, "the built-in template"); } },
     { "--served-model-name",  [](const Config& c) { return or_none(c.served_model_name, "the container's name"); } },
     { "--mm-max-patches",     [](const Config& c) { return c.mm_max_patches < 0 ? std::string("auto") : num(c.mm_max_patches); } },
+    { "--mm-audio-frames",    [](const Config& c) { return c.mm_audio_frames < 0 ? std::string("auto") : num(c.mm_audio_frames); } },
     { "--image-gen-max-pixels", [](const Config& c) { return c.image_gen_max_pixels > 0 ? num(c.image_gen_max_pixels) : std::string("the model's"); } },
     { "--image-gen-max-refs", [](const Config& c) { return c.image_gen_max_refs > 0 ? num(c.image_gen_max_refs) : std::string("the model's"); } },
     { "--generation-config",  [](const Config& c) { return or_none(c.generation_config, "none"); } },

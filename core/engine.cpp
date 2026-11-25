@@ -455,6 +455,8 @@ void Engine::flex_service() {
     std::lock_guard<std::mutex> lk(flex_mu_);
     if (flex_got_ >= 0) return;
     drain_streams();
+    /* Release any finished requests' deferred blocks before measuring free room. */
+    if (sched_.has_deferred()) sched_.release_deferred();
     /* The experts' loan first: giving it back is an address change for each unit in it. */
     const int64_t xgot = xflex_give(flex_want_);
     if (xgot >= flex_want_ || !flex_kv_) {
@@ -467,29 +469,69 @@ void Engine::flex_service() {
     const int64_t want = (flex_want_ - xgot + tb - 1) / tb;
     const int64_t floor_loan = k0.flex_floor_loan();
     const int64_t cur = sched_.locked([&] { return k0.loan_tokens(); });
-    /* spare_tokens() counts from the top of the carve, and a flex carve's top is the unbacked
-     * reservation: what is free below the live mark is that less the loan. Never below the floor
-     * the claim pays for. */
+    /* spare_tokens_peek() reads without decaying short_peak_ across predicate checks. */
     auto room_locked = [&] {
-        return std::max<int64_t>(std::min(k0.spare_tokens() - cur, floor_loan - cur), 0);
+        return std::max<int64_t>(std::min(k0.spare_tokens_peek() - cur, floor_loan - cur), 0);
     };
     auto room = [&] { return sched_.locked(room_locked); };
     int64_t spare = room();
     /* What the floor lets go however empty the cache is. Past that, evicting or preempting costs
      * conversations and frees nothing the fleet can have. */
     const int64_t goal = std::min(want, std::max<int64_t>(floor_loan - cur, 0));
+    const int64_t target_loan = cur + goal;
+    /* Wall-clock budget for synchronous host-tier flushes: 3 s for Phase A, plus at least 500 ms
+     * per Phase B victim up to a 7 s hard cap (well under Fleet's 10 s wait). */
+    const uint64_t t0 = rad_mono_ns();
+    const uint64_t deadline_ns = t0 + 3000ull * 1000000ull;
+    const uint64_t hard_cap_ns = t0 + 7000ull * 1000000ull;
+
+    /* Phase A: reclaim idle VRAM entries at or above the target mark BEFORE preempting live
+     * requests. Trim already-host-backed entries first, then synchronously flush pending copies
+     * to host RAM and trim again; only uncopied VRAM-only unheld stragglers above the mark are
+     * erased (host-tier entries and waiting requests' held_ chains are always preserved). */
     if (spare < goal && cfg_.prefix_cache) {
-        (void)sched_.evict_prefix_until([&] { return room_locked() >= goal; });
+        (void)sched_.locked([&] { return ranks_[0]->prefix.reclaim_above(target_loan, false); });
         spare = room();
+        if (spare < goal) {
+            (void)flush_copies_unlocked(/*drain_all=*/true, deadline_ns);
+            (void)sched_.locked([&] { return ranks_[0]->prefix.reclaim_above(target_loan, false); });
+            spare = room();
+        }
+        if (spare < goal) {
+            (void)sched_.locked([&] { return ranks_[0]->prefix.reclaim_above(target_loan, true); });
+            spare = room();
+        }
     }
+
+    /* Phase B: preempt one top-block victim at a time, synchronously flushing its published KV
+     * to host RAM and trimming above-mark blocks after EACH victim so a second runner whose
+     * blocks sit below the mark is spared. */
     if (spare < goal && flex_preempt_) {
-        const int n = sched_.preempt_until([&] { return room_locked() >= goal; });
-        if (sched_.has_deferred()) sched_.release_deferred();
-        if (n > 0)
+        int preempted = 0;
+        while (spare < goal && sched_.preempt_highest_above(target_loan)) {
+            ++preempted;
+            if (sched_.has_deferred()) sched_.release_deferred();
+            if (cfg_.prefix_cache) {
+                const uint64_t v_deadline = std::min<uint64_t>(
+                    hard_cap_ns, std::max<uint64_t>(deadline_ns, rad_mono_ns() + uint64_t(500) * 1000000));
+                (void)flush_copies_unlocked(/*drain_all=*/true, v_deadline);
+                (void)sched_.locked([&] { return ranks_[0]->prefix.reclaim_above(target_loan, false); });
+                spare = room();
+                if (spare < goal) {
+                    (void)sched_.locked([&] { return ranks_[0]->prefix.reclaim_above(target_loan, true); });
+                    spare = room();
+                }
+            } else {
+                spare = room();
+            }
+        }
+        if (preempted > 0)
             RAD_INFO("flex: %d running request(s) go back to the queue so a higher-priority model "
-                     "takes the cache", n);
-        spare = room();
+                     "takes the cache", preempted);
     }
+
+    /* Guarantee every issued D2H copy stream is idle before unbacking VMem stripes. */
+    drain_streams();
     const int64_t take = std::min(goal, spare);
     const int64_t before = ranks_[0]->pools.kv().committed();
     if (take > 0 && sched_.locked([&] { return k0.set_loan(cur + take); }) == RAD_OK) {
@@ -2871,6 +2913,14 @@ void Engine::expire_tick(uint64_t now_ns) {
 }
 
 bool Engine::flush_copies() {
+    return flush_copies_impl(/*locked=*/true, /*drain_all=*/false, 0);
+}
+
+bool Engine::flush_copies_unlocked(bool drain_all, uint64_t deadline_ns) {
+    return flush_copies_impl(/*locked=*/false, drain_all, deadline_ns);
+}
+
+bool Engine::flush_copies_impl(bool locked, bool drain_all, uint64_t deadline_ns) {
     if (!pump_ || !ranks_[0]->tierx.enabled()) return false;
     TierPump& P = *pump_;
     Rank& lead = *ranks_[0];
@@ -2881,9 +2931,12 @@ bool Engine::flush_copies() {
         IdleTiers& t; uint64_t t0; bool worked = false;
         ~Note() { if (worked) t.note_flush((int64_t)(rad_mono_ns() - t0)); }
     } note{lead.tiers, t0};
-    /* Bounded: each round lands one batch of P.max_copy entries; a larger shortfall cannot be
-     * relieved in one step. */
-    for (int round = 0; round < 64; ++round) {
+    const int max_rounds = drain_all ? 4096 : 64;
+    std::vector<TierJob> drops;
+    /* Loop exits ONLY after waiting and clearing P.copy so no in-flight copy can ever race
+     * subsequent evictions or VMem unback. When !locked, sched_.hold() guards only bookkeeping
+     * (plan_flush_step / report_pass) while wait_copy and issue_copy run outside mu_. */
+    for (int round = 0;; ++round) {
         if (!P.copy.empty()) {
             note.worked = true;
             bool good = true;
@@ -2893,13 +2946,35 @@ bool Engine::flush_copies() {
             }
             if (ranks_.size() > 1) (void)rad_dev_set(lead.device);
             const std::vector<char> ok(P.copy.size(), good ? 1 : 0);
-            lead.tierx.report_pass(P.copy, ok, rad_mono_ns());
+            if (locked) {
+                lead.tierx.report_pass(P.copy, ok, rad_mono_ns());
+            } else {
+                const auto lk = sched_.hold();
+                lead.tierx.report_pass(P.copy, ok, rad_mono_ns());
+            }
             P.copy.clear();
             landed = landed || good;
         }
-        if (!lead.tiers.writeback_waiting()) break;
-        lead.tiers.plan_writeback(P.max_copy, &P.copy);
-        if (P.copy.empty()) break;
+        if (round >= max_rounds) break;
+        if (deadline_ns > 0 && rad_mono_ns() >= deadline_ns) break;
+
+        drops.clear();
+        bool any = false;
+        if (locked) {
+            /* Locked flush serves restore_plan/evict, whose contract promises never to drop
+             * another conversation's host-only entry: pass drop_budget = 0. */
+            any = lead.tiers.plan_flush_step(P.max_copy, /*drop_budget=*/0, &P.copy, &drops);
+        } else {
+            const auto lk = sched_.hold();
+            any = lead.tiers.plan_flush_step(P.max_copy, P.slow_budget, &P.copy, &drops);
+            if (!drops.empty()) {
+                const std::vector<char> ok(drops.size(), 1);
+                lead.tierx.report_pass(drops, ok, rad_mono_ns());
+            }
+        }
+        if (!any) break;
+        if (P.copy.empty()) continue;   /* starved drops just freed host slots; retry writeback */
+
         P.copy_st.assign(ranks_.size(), 0);
         for (size_t i = 0; i < ranks_.size(); ++i) {
             const int st = ranks_[i]->tierx.issue_copy(P.copy, ranks_[i]->ctx.stream());

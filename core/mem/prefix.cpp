@@ -881,6 +881,54 @@ int64_t PrefixCache::drop_stragglers(int64_t loan_goal, bool recheck) {
     return n;
 }
 
+int64_t PrefixCache::reclaim_above(int64_t loan_goal, bool allow_erase) {
+    if (!enabled_ || !kv_ || loan_goal <= 0) return 0;
+    const size_t ng = entry_groups_.size();
+    std::vector<int64_t> mark(ng, INT64_MAX);
+    bool any_lendable = false;
+    for (size_t k = 0; k < ng; ++k) {
+        const int32_t g = entry_groups_[k];
+        if (!kv_->lendable(g)) continue;
+        mark[k] = kv_->flex_mark_blocks(g, loan_goal);
+        any_lendable = true;
+    }
+    if (!any_lendable) return 0;
+
+    const bool keep = tiers_ && tiers_->host_on() && demotable_;
+    int64_t n = 0;
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        const BlockHash h = *it;
+        auto m = map_.find(h);
+        if (m == map_.end()) { it = lru_.erase(it); continue; }
+        Entry& e = m->second;
+        bool above = false;
+        for (size_t k = 0; k < ng && k < e.blocks.size(); ++k)
+            if (e.blocks[k] >= mark[k]) { above = true; break; }
+        if (!above || held_.count(h) > 0 || shared_with_live(e)) {
+            ++it;
+            continue;
+        }
+        if (keep && tiers_->droppable(h)) {
+            it = lru_.erase(it);
+            e.in_lru = false;
+            release_blocks(e);
+            tiers_->drop_commit(h);
+            ++stats_.drops;
+            ++n;
+            continue;
+        }
+        if (!allow_erase) { ++it; continue; }
+        it = lru_.erase(it);
+        e.in_lru = false;
+        release_blocks(e);
+        if (tiers_) tiers_->forget(h);
+        map_.erase(m);
+        ++stats_.evictions;
+        ++n;
+    }
+    return n;
+}
+
 /* The KV manager tracks how many cache-held blocks are at refcount one. One group only: the paged
  * groups share a token axis and an entry is blocks_per_entry() blocks in each, so summing groups
  * would multiply the answer. Off-device entries hold no blocks and count for nothing. */

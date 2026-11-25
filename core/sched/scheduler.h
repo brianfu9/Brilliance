@@ -379,6 +379,10 @@ public:
      * lower-priority model's cache while it is busy (docs/MULTIMODEL.md §6.4). Between steps
      * only, with nothing in flight. Returns how many went back. */
     int      preempt_until(const std::function<bool()>& enough);
+    /* Preempt the single running request holding the highest full-attention block at or above the
+     * live mark of `target_loan` (tie-break: newest arrival). Returns false if no running request
+     * holds a block above that mark. Between steps only, with nothing in flight. */
+    bool     preempt_highest_above(int64_t target_loan);
     /* The end-of-generation ids the card's acceptance reads, for ends_every_request. Set once at
      * start; without them only max_tokens ends are predicted. */
     void     set_eog(std::vector<int32_t> ids);

@@ -489,6 +489,8 @@ public:
      * the carve down to the highest held block plus the buffer. Rank 0 only (a follower tracks no
      * held blocks). Also decays the buffer's shortfall term, so call it once per arbiter tick. */
     int64_t spare_tokens();
+    /* Read-only view of spare_tokens() without decaying short_peak_: safe inside predicate loops. */
+    int64_t spare_tokens_peek() const;
 
     /* Lends `tokens` from the top, or takes back what a smaller number no longer covers. Lending
      * past a held block is refused (RAD_E_STATE). Taking back always succeeds here; the caller
@@ -518,6 +520,10 @@ public:
     /* The same under a loan of `tokens`: the first block of the group that loan would take. A
      * group that does not lend answers its whole carve. */
     int64_t live_blocks_at(int32_t group, int64_t tokens) const;
+    /* Reclaim mark for a flex shrink toward `tokens` lent: live_blocks_at minus buf_blocks(),
+     * rounded down to a held_hist_ bucket boundary, so clearing all blocks >= mark makes
+     * spare_tokens_peek() >= tokens. */
+    int64_t flex_mark_blocks(int32_t group, int64_t tokens) const;
     /* Where a group's stragglers start. A loan reaches down only to the highest held block, so a
      * few held blocks high in the pool keep everything between them and the dense part of the
      * cache from the expert slab. Giving up the held blocks at or above a mark m extends what

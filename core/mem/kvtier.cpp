@@ -435,6 +435,32 @@ void IdleTiers::plan(int budget, std::vector<TierJob>* out) {
     room_.clear();
 }
 
+bool IdleTiers::plan_flush_step(int64_t max_copy, int drop_budget,
+                                std::vector<TierJob>* copy_out,
+                                std::vector<TierJob>* drops_out) {
+    if (copy_out) copy_out->clear();
+    if (drops_out) drops_out->clear();
+    if (!host_on()) return false;
+    /* Drain starved drops BEFORE checking writeback_waiting(): when wb_stuck_ is set and the
+     * host arena is full, writeback_waiting() returns false until a drop frees a slot. */
+    if (starved() && drops_out && drop_budget > 0) {
+        plan(drop_budget, drops_out);
+        if (!drops_out->empty()) return true;
+    }
+    if (!writeback_waiting()) return false;
+    if (copy_out && max_copy > 0) {
+        plan_writeback(max_copy, copy_out);
+        if (!copy_out->empty()) return true;
+    }
+    /* A refusal in plan_writeback() just populated room_; plan those drops immediately so the
+     * next call can allocate the freed host slots. */
+    if (starved() && drops_out && drop_budget > 0) {
+        plan(drop_budget, drops_out);
+        if (!drops_out->empty()) return true;
+    }
+    return false;
+}
+
 void IdleTiers::expired(uint64_t cutoff_ns, size_t max, std::vector<BlockHash>* out) const {
     std::lock_guard lk(mu_);
     /* The list holds no pending record (relist), so every key here can go now. */

@@ -317,6 +317,12 @@ public:
      * prefilled again if their conversation returns. Context that fills its part of the pool
      * stays: there the cache is worth more than the loan it holds back. */
     int64_t drop_clean(int64_t loan_goal = 0);
+    /* Drop VRAM-resident entries holding any block at or above the live mark of `loan_goal`,
+     * skipping entries shared with a live sequence or pinned in `held_`. Entries whose host copy
+     * has landed move cleanly to the host tier (drop_commit); when `allow_erase` is true,
+     * VRAM-only uncopied entries above the mark are also erased (never touching entries already
+     * on the host tier). Returns how many entries left VRAM. */
+    int64_t reclaim_above(int64_t loan_goal, bool allow_erase);
     int64_t size() const { return (int64_t)map_.size(); }
     /* Entries holding blocks in the pool, as opposed to only a copy off the card. */
     int64_t resident() const { return (int64_t)lru_.size(); }

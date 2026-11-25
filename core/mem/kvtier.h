@@ -171,6 +171,15 @@ public:
      * for; `budget` bounds one plan. */
     void plan(int budget, std::vector<TierJob>* out);
 
+    /* One synchronous flush step: drains starved capacity drops BEFORE checking writeback_waiting()
+     * (wb_stuck_ makes writeback_waiting() false while the arena is full), then plans up to
+     * `max_copy` writebacks, and if that refusal newly populated `room_`, plans drops immediately.
+     * Caller reports `drops_out` (host-only, no device copy) before issuing `copy_out`. Returns
+     * true when either output vector is non-empty. */
+    bool plan_flush_step(int64_t max_copy, int drop_budget,
+                         std::vector<TierJob>* copy_out,
+                         std::vector<TierJob>* drops_out);
+
     /* ---------------- expiry ----------------
      *
      * Host records unused since `cutoff_ns`, oldest first, up to `max` (--prefix-cache-ttl). The

@@ -646,17 +646,13 @@ int64_t Scheduler::evict_prefix_until(const std::function<bool()>& enough) {
     std::lock_guard<std::mutex> lk(mu_);
     if (!pc_ || !cfg_.prefix_cache) return 0;
     int64_t total = 0;
-    /* Doubling, since the blocks that free the top of the pool may be anywhere in the LRU order. */
+    /* Doubling, since the blocks that free the top of the pool may be anywhere in the LRU order.
+     * Use evict() (trim -> flush -> trim -> evict_lru) rather than reset() so host-tier entries
+     * are preserved instead of wiped. */
     for (int64_t n = 64; !enough(); n *= 2) {
-        const int64_t done = pc_->trim(n);
+        const int64_t done = pc_->evict(n);
         if (done <= 0) break;
         total += done;
-    }
-    /* What is left has no host copy to fall back on, or one still on its way. */
-    if (!enough()) {
-        const int64_t dropped = pc_->reset();
-        RAD_INFO("prefix cache: reset for room, %lld entries dropped", (long long)dropped);
-        total += dropped;
     }
     return total;
 }
@@ -669,6 +665,38 @@ int Scheduler::preempt_until(const std::function<bool()>& enough) {
         ++n;
     }
     return n;
+}
+
+bool Scheduler::preempt_highest_above(int64_t target_loan) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (running_.empty()) return false;
+    int32_t victim = -1;
+    int64_t best_blk = -1;
+    uint64_t best_arrival = 0;
+    for (int32_t slot : running_) {
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req) continue;
+        int64_t slot_max = -1;
+        for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+            if (kvgeom_.g[g].kind != RAD_KV_FULL || kv_->total_blocks((int32_t)g) <= 0) continue;
+            const int64_t mark = kv_->flex_mark_blocks((int32_t)g, target_loan);
+            for (int32_t b : kv_->block_table(s.req->id, (int32_t)g))
+                if (b >= mark && b > slot_max) slot_max = b;
+        }
+        if (slot_max >= 0 && (slot_max > best_blk ||
+                              (slot_max == best_blk && s.arrival > best_arrival))) {
+            victim = slot;
+            best_blk = slot_max;
+            best_arrival = s.arrival;
+        }
+    }
+    if (victim < 0) return false;
+    if (victim != running_.back()) {
+        running_.erase(std::find(running_.begin(), running_.end(), victim));
+        running_.push_back(victim);
+    }
+    (void)preempt_back();
+    return true;
 }
 
 int Scheduler::release_session(const std::string& label, uint64_t id, int64_t keep_tokens,

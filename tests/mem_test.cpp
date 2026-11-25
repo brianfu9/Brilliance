@@ -8630,6 +8630,116 @@ TEST(kvsnap_round_trip_and_safety_guards) {
     f1.pc.set_tiers(nullptr);
 }
 
+/* H3 + M8: when the host arena is full and wb_stuck_ makes writeback_waiting() return false,
+ * IdleTiers::plan_flush_step() must drain starved() DropHost jobs FIRST, clearing wb_stuck_ so
+ * newer higher-value writebacks land on host RAM instead of being lost to evict_lru. */
+TEST(plan_flush_step_drains_starved_host_drops_past_wb_stuck) {
+    IdleTiers t;
+    IdleTiers::Config tc;
+    tc.entry_bytes = 64;
+    tc.host_cap_bytes = 256;          /* 4 host slots total */
+    tc.block_tokens = 16;
+    CHECK_OK(t.configure(tc));
+
+    std::vector<BlockHash> old_keys, new_keys;
+    for (int i = 0; i < 4; ++i) {
+        BlockHash h{ (uint64_t)(100 + i), 1 };
+        old_keys.push_back(h);
+        t.note_used(h, { i }, /*now_ns=*/1000, /*depth=*/i);
+    }
+    /* Land all 4 older entries on host RAM and drop their VRAM copies so host_lru_ holds them. */
+    std::vector<TierJob> copy, drops;
+    REQUIRE(t.plan_flush_step(16, 16, &copy, &drops));
+    REQUIRE_EQ((int)copy.size(), 4);
+    for (const TierJob& j : copy) t.report(j, true, 1000);
+    for (const BlockHash& h : old_keys) t.drop_commit(h);
+
+    /* Now queue 4 newer entries (used_ns = 5000 > 1000). A plain plan_writeback() refuses all 4
+     * and sets wb_stuck_ = true -> writeback_waiting() becomes false! */
+    for (int i = 0; i < 4; ++i) {
+        BlockHash h{ (uint64_t)(200 + i), 2 };
+        new_keys.push_back(h);
+        t.note_used(h, { 10 + i }, /*now_ns=*/5000, /*depth=*/i);
+    }
+    std::vector<TierJob> refused_probe;
+    t.plan_writeback(16, &refused_probe);
+    CHECK(refused_probe.empty());
+    CHECK(!t.writeback_waiting());    /* wb_stuck_ && arena_.full() hides pending copies */
+    CHECK(t.starved());
+
+    /* plan_flush_step() must drain starved drops first, then land all 4 newer entries. */
+    int landed = 0;
+    for (int round = 0; round < 16; ++round) {
+        if (!t.plan_flush_step(16, 16, &copy, &drops)) break;
+        for (const TierJob& d : drops) t.report(d, true, 5000);
+        for (const TierJob& c : copy) { t.report(c, true, 5000); ++landed; }
+    }
+    CHECK_EQ(landed, 4);
+    for (const BlockHash& h : new_keys) CHECK(t.droppable(h));
+}
+
+/* H2 + M5: PrefixCache::reclaim_above() leaves entries below the target mark untouched in VRAM,
+ * moves host-backed entries above the mark to the host tier without erasing, skips held_ chains,
+ * and only erases uncopied unheld VRAM-only entries above the mark when allow_erase is true. */
+TEST(reclaim_above_targets_mark_preserves_host_and_held_chains) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    /* A has entries on host (already dropped) + some in VRAM; B is freshly inserted in VRAM.
+     * Hold session B's chain: reclaim_above must spare held_ entries even with allow_erase=true. */
+    const int64_t host_before = (int64_t)x.f.pc.restorable_from(s.a, {}).size();
+    REQUIRE(host_before > 0);
+    x.f.pc.hold(77, s.b, {});
+    const int64_t loan_goal = x.f.kv.total_blocks(G_FULL) * 16 / 2;   /* top half of pool */
+    (void)x.f.pc.reclaim_above(loan_goal, /*allow_erase=*/true);
+    /* Host-resident entries of A must remain intact (never wiped like clear()/reset()). */
+    CHECK_EQ((int64_t)x.f.pc.restorable_from(s.a, {}).size(), host_before);
+    /* Held chain B must remain intact in VRAM. */
+    CHECK_EQ(x.f.pc.lookup(s.b, {}).n_attn_tokens, (int32_t)(s.n * 16));
+    /* Release hold on B, land B's host copies, then reclaim_above(allow_erase=false) drops B's
+     * above-mark blocks cleanly to host without any eviction loss. */
+    x.f.pc.release(77);
+    const int64_t ev_before = x.f.pc.stats().evictions;
+    copy_now(x.t);
+    const int64_t dropped = x.f.pc.reclaim_above(loan_goal, /*allow_erase=*/false);
+    CHECK(dropped > 0);
+    CHECK_EQ(x.f.pc.stats().evictions, ev_before);
+    CHECK((int64_t)x.f.pc.restorable_from(s.b, {}).size() >= dropped);
+}
+
+/* M7: spare_tokens_peek() returns the same value as spare_tokens() without decaying short_peak_. */
+TEST(spare_tokens_peek_does_not_decay_short_peak) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const int64_t p1 = x.f.kv.spare_tokens_peek();
+    const int64_t p2 = x.f.kv.spare_tokens_peek();
+    const int64_t p3 = x.f.kv.spare_tokens_peek();
+    CHECK_EQ(p1, p2);
+    CHECK_EQ(p2, p3);
+}
+
+/* H1: PrefixCache::reclaim_above() uses KVManager::flex_mark_blocks() (accounting for buf_blocks
+ * and held_hist bucket rounding) so after host copies land and above-mark entries are dropped,
+ * spare_tokens_peek() reaches the requested loan goal and set_loan(loan_goal) succeeds with 0
+ * evictions. */
+TEST(reclaim_above_reaches_spare_tokens_goal_with_buf_blocks) {
+    TierFixture x;
+    CHECK_OK(x.build());
+    const TwoSessions s = two_sessions(x, /*b_live=*/false, /*a_snapshots=*/false);
+    copy_now(x.t);
+    const int64_t ev_before = x.f.pc.stats().evictions;
+    const int64_t total_tok = x.f.kv.total_blocks(G_FULL) * 16;
+    const int64_t loan_goal = total_tok / 2;
+    REQUIRE(x.f.kv.spare_tokens_peek() < loan_goal);
+    const int64_t dropped = x.f.pc.reclaim_above(loan_goal, /*allow_erase=*/false);
+    CHECK(dropped > 0);
+    CHECK_EQ(x.f.pc.stats().evictions, ev_before);
+    CHECK(x.f.kv.spare_tokens_peek() >= loan_goal);
+    CHECK_OK(x.f.kv.set_loan(loan_goal));
+    /* Below-mark host entries and dropped above-mark entries remain restorable. */
+    CHECK(!x.f.pc.restorable_from(s.b, {}).empty());
+}
+
 RAD_TEST_MAIN()
 
 /* A streamed-only op exists only when the architecture's capability table says it can stream AND

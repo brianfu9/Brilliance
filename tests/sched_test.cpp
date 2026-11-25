@@ -2606,6 +2606,42 @@ TEST(a_long_wait_does_not_erode_the_claimant_anchor_gate) {
     CHECK_EQ(f.sch.metrics().preemptions, 0);
 }
 
+/* evict_prefix_until uses pc_->evict() (flush + trim, preserving host tier) and never calls
+ * pc_->reset(), which would wipe host-resident entries. */
+TEST(evict_prefix_until_uses_evict_and_never_calls_reset) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.evict_grant = 100;
+    const int64_t done = f.sch.evict_prefix_until([] { return false; });
+    CHECK_EQ(done, 100);
+    CHECK(f.pc.evict_calls >= 2);
+    CHECK_EQ(f.pc.reset_calls, 0);
+}
+
+/* H2: preempt_highest_above picks the running request holding the highest block >= target mark
+ * (not just running_.back()) and returns false when no running request holds a block above mark. */
+TEST(preempt_highest_above_picks_top_block_victim_and_stops_when_none_above) {
+    Fixture f;
+    f.build(/*blocks=*/32, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/512);
+    CHECK_OK(f.start());
+
+    const uint64_t r1 = f.submit(64, 16, /*priority=*/5);    /* lower priority/higher arrival? pri=5 is front */
+    const uint64_t r2 = f.submit(64, 16, /*priority=*/0);    /* pri=0 is running_.back() */
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    /* Give r1 (front of running_) a high block id near the top of the 32-block pool while r2
+     * (back of running_) holds only low blocks. Target loan = 80 tokens (5 blocks -> mark 27). */
+    const int32_t g = 0;
+    f.kv.seqs[r1].blocks[g].push_back(30);                   /* block 30 >= mark 27 */
+    CHECK(f.sch.preempt_highest_above(/*target_loan=*/80));
+    CHECK_EQ((int)f.sch.find(r1)->state, (int)ReqState::Preempted);
+    CHECK_EQ((int)f.sch.find(r2)->state, (int)ReqState::Running);
+    /* r2 holds only blocks < 27: preempt_highest_above stops without touching r2. */
+    CHECK(!f.sch.preempt_highest_above(/*target_loan=*/80));
+    CHECK_EQ((int)f.sch.find(r2)->state, (int)ReqState::Running);
+}
+
 /* The gate when the running set drains: B and C were both held behind A, and each fits the empty
  * pool alone but not beside the other. The step after A finishes must admit one of them, not both:
  * this step's admissions join running_ only after the walk, so a gate that is skipped while

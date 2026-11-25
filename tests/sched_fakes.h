@@ -390,6 +390,12 @@ struct FakeKV : IKVManager {
     int64_t held_blocks(int32_t g) const override {
         return total[(size_t)g] - (int64_t)freelist[(size_t)g].size();
     }
+    int64_t live_blocks_at(int32_t g, int64_t tokens) const override {
+        const KVGeom::G& gg = geom.g[(size_t)g];
+        if (!gg.paged || gg.block_size <= 0 || tokens <= 0) return total[(size_t)g];
+        const int64_t lent = tokens / gg.block_size;
+        return lent >= total[(size_t)g] ? 0 : total[(size_t)g] - lent;
+    }
     /* A byte size per object, so the sum is checkable. The real manager reads these off the
      * carved plan; here the test sets them, and a group left at zero contributes nothing. */
     std::vector<int64_t> block_bytes, state_bytes;
@@ -559,9 +565,14 @@ struct FakePC : IPrefixCache {
     }
     /* What the reserve asked for, call by call. */
     std::vector<int64_t> trims;
+    int64_t reset_calls = 0;
     int64_t trim(int64_t n) override {
         trims.push_back(n);
         return 0;
+    }
+    int64_t reset() override {
+        ++reset_calls;
+        return IPrefixCache::reset();
     }
     /* Cumulative, like the real cache's: the scheduler publishes it as a counter and the server
      * takes deltas, so a per-call value would read as a cache that never evicts. */

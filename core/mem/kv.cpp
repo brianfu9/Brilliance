@@ -857,6 +857,17 @@ int64_t KVManager::live_blocks_at(int32_t g, int64_t tokens) const {
     if (g < 0 || g >= (int32_t)plans_.size()) return 0;
     return plans_[(size_t)g].n_blocks - lent_blocks((size_t)g, tokens);
 }
+int64_t KVManager::flex_mark_blocks(int32_t g, int64_t tokens) const {
+    if (g < 0 || g >= (int32_t)plans_.size()) return 0;
+    const KVGroupPlan& p = plans_[(size_t)g];
+    if (!lendable(p.index) || tokens <= 0) return p.n_blocks;
+    const int64_t need_lent = (tokens + p.block_size - 1) / p.block_size;
+    int64_t mark = p.n_blocks - need_lent - buf_blocks((size_t)g);
+    if (mark <= 0) return 0;
+    const int64_t per = bucket_blocks_[(size_t)g];
+    if (per > 1) mark = (mark / per) * per;
+    return mark;
+}
 int64_t KVManager::straggler_mark(int32_t g) const {
     if (g < 0 || g >= (int32_t)plans_.size()) return 0;
     const int64_t top = held_top((size_t)g), per = bucket_blocks_[(size_t)g];
@@ -957,11 +968,17 @@ int KVManager::grow_for(int32_t g, int64_t blocks, bool* waiting_for_fleet) {
 }
 
 int64_t KVManager::spare_tokens() {
-    int64_t spare = -1;
     for (size_t i = 0; i < plans_.size(); ++i) {
         /* Decay the shortfall peak by 1/8 a tick (a half-life of about half a second), so one
          * large admission does not pin its size of buffer for the life of the process. */
         if (i < short_peak_.size()) short_peak_[i] -= short_peak_[i] / 8;
+    }
+    return spare_tokens_peek();
+}
+
+int64_t KVManager::spare_tokens_peek() const {
+    int64_t spare = -1;
+    for (size_t i = 0; i < plans_.size(); ++i) {
         if (!lendable(plans_[i].index)) continue;
         const KVGroupPlan& p = plans_[i];
         int64_t keep = held_top(i) + buf_blocks(i);

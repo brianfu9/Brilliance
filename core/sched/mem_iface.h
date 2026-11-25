@@ -117,6 +117,17 @@ struct IKVManager {
     virtual int64_t held_blocks(int32_t group) const = 0;
     /* KVManager::held_top_blocks; a manager that cannot answer says the whole row. */
     virtual int64_t held_top_blocks(int32_t group) const { (void)group; return INT64_MAX; }
+    /* KVManager::live_blocks_at; first block index taken by a loan of `tokens` (total_blocks
+     * when the group does not lend or the manager has no loan concept). */
+    virtual int64_t live_blocks_at(int32_t group, int64_t tokens) const {
+        (void)tokens;
+        return total_blocks(group);
+    }
+    /* KVManager::flex_mark_blocks; reclaim mark accounting for spare_tokens' buffer and bucket
+     * rounding so clearing blocks >= mark reaches spare_tokens_peek() >= tokens. */
+    virtual int64_t flex_mark_blocks(int32_t group, int64_t tokens) const {
+        return live_blocks_at(group, tokens);
+    }
 
     /* The pool in bytes, the only unit that sums across groups. Asked of the manager because its
      * plan knows whether a group counts blocks or states. */
@@ -462,6 +473,12 @@ struct KVBinding final : IKVManager {
     int64_t total_blocks(int32_t g) const override  { return m->total_blocks(g); }
     int64_t held_blocks(int32_t g) const override   { return m->held_blocks(g); }
     int64_t held_top_blocks(int32_t g) const override { return m->held_top_blocks(g); }
+    int64_t live_blocks_at(int32_t g, int64_t tokens) const override {
+        return m->live_blocks_at(g, tokens);
+    }
+    int64_t flex_mark_blocks(int32_t g, int64_t tokens) const override {
+        return m->flex_mark_blocks(g, tokens);
+    }
     int64_t pool_bytes(int32_t g) const override      { return m->pool_bytes(g); }
     int64_t pool_bytes_used(int32_t g) const override { return m->pool_bytes_used(g); }
     int64_t pool_bytes_carved(int32_t g) const override { return m->pool_bytes_carved(g); }

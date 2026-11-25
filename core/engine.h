@@ -910,9 +910,13 @@ private:
     /* --prefix-cache-ttl, once a second, with or without the tiers (PrefixCache::expire). */
     void expire_tick(uint64_t now_ns);
     uint64_t expire_last_ns_ = 0;
-    /* Issue and land every waiting host copy now. Called under the scheduler's lock by an
-     * eviction that would otherwise erase what the copies cover. True when any landed. */
+    /* Issue and land every waiting host copy now. flush_copies() runs under the scheduler's lock
+     * (from PCBinding::flush_fn); flush_copies_unlocked() takes sched_.hold() per round and waits
+     * on device copies outside the lock (from Engine::flex_service), never returning with a copy
+     * still in flight. True when any landed. */
     bool flush_copies();
+    bool flush_copies_unlocked(bool drain_all, uint64_t deadline_ns);
+    bool flush_copies_impl(bool locked, bool drain_all, uint64_t deadline_ns);
     /* The KV loan: what the cache is not using, lent to every rank's expert slab at addresses the
      * cache already owns (KVManager, the loan block). Lives here, not in the scheduler, because
      * rank 0's cache sets the amount while every rank's mover fills or empties slots, and a mover

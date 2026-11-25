@@ -1,5 +1,6 @@
 // The fleet: what is on each card, what every model is doing, and how that moved over the window.
 import { useCallback, useEffect, useMemo } from "react"
+import { ModelLoad } from "@/components/model-load"
 import { ModelSwitch } from "@/components/model-switch"
 import { Chart, Legend, type Line } from "@/components/chart"
 import { Empty, Kpi, Panel, PartBar, PartLegend, StateBadge, StateDot, STATE_OF_CODE, stateOf, type Part } from "@/components/bits"
@@ -98,6 +99,7 @@ export function Overview() {
               <TableHead className="pl-4">Model</TableHead>
               <TableHead>On</TableHead>
               <TableHead>State</TableHead>
+              <TableHead>Action</TableHead>
               <TableHead className="text-right">Priority</TableHead>
               <TableHead>Accelerators</TableHead>
               <TableHead className="text-right">VRAM</TableHead>
@@ -120,6 +122,7 @@ export function Overview() {
                 </TableCell>
                 <TableCell><ModelSwitch id={m.id} off={!!m.off} /></TableCell>
                 <TableCell><StateBadge state={m.state} doing={m.doing} /></TableCell>
+                <TableCell onClick={(e) => e.stopPropagation()}><ModelLoad id={m.id} state={m.state} doing={m.doing} off={!!m.off} size="xs" /></TableCell>
                 <TableCell className="num text-right">{fNum(m.priority)}{m.pinned ? " · pinned" : ""}</TableCell>
                 <TableCell className="num text-muted-foreground">{m.cards?.length ? m.cards.join(", ") : "–"}</TableCell>
                 <TableCell className="num text-right">{held(m) > 0 ? fBytes(held(m)) : "–"}</TableCell>

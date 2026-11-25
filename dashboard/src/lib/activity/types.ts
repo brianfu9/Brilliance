@@ -95,6 +95,9 @@ export interface ActivityLogEntry {
   tokens: TokenMetrics;
   duration_ms: number;
   has_capture: boolean;
+  /** (local) Where History keeps this request's body ("seg:offset:length"), and its id. */
+  capture_loc?: string;
+  capture_rid?: string;
   error_msg?: string;
   metadata?: Record<string, string>;
 }

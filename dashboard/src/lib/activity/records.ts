@@ -38,6 +38,7 @@ export interface RequestRecord {
   ses: string
   pri: number
   tag: string
+  body: string          // (local) the body store locator, "" when no body was kept
 }
 
 /** GET /history/requests: kept records, oldest first, as columns. */
@@ -115,7 +116,7 @@ export function normalize(o: Record<string, unknown>): RequestRecord {
     pms: num(o.pms, -1), dms: num(o.dms, -1), prms: num(o.prms), ms: num(o.ms),
     pps: num(o.pps), tps: num(o.tps), ttft: typeof o.ttft === "number" ? o.ttft : null,
     audio_s: num(o.audio_s),
-    ses: str(o.ses), pri: num(o.pri), tag: str(o.tag),
+    ses: str(o.ses), pri: num(o.pri), tag: str(o.tag), body: str(o.body),
   }
 }
 
@@ -156,7 +157,9 @@ export function toEntry(r: RequestRecord, fallbackModel: string): ActivityLogEnt
       prompt_ms: Math.round(r.pms), predicted_ms: Math.round(r.dms), preempted_ms: Math.round(r.prms),
     },
     duration_ms: Math.round(r.ms),
-    has_capture: false,
+    has_capture: r.body !== "",
+    capture_loc: r.body || undefined,
+    capture_rid: r.body ? r.rid : undefined,
     error_msg: r.err || undefined,
     metadata,
   }

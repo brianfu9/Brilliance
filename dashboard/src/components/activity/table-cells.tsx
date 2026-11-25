@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { compactActivitySource } from "@/lib/activity/activitySource";
 import { copyText } from "@/lib/activity/clipboard";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { CaptureDialog } from "./CaptureDialog";
 
 interface HeaderLabelProps {
   label: string;
@@ -120,9 +121,18 @@ export function SourceCell({ source }: SourceCellProps) {
 }
 
 /**
- * The capture column. There are no request captures in this port, so the cell
- * always renders what ViewCaptureButton rendered when there was no capture.
+ * The capture column (local): a request whose body History kept opens it in CaptureDialog;
+ * otherwise "-", as ViewCaptureButton rendered with no capture.
  */
-export function CaptureCell() {
-  return <span className="text-muted-foreground">-</span>;
+export function CaptureCell({ rid, loc }: { rid?: string; loc?: string }) {
+  const [open, setOpen] = useState(false);
+  if (!rid || !loc) return <span className="text-muted-foreground">-</span>;
+  return (
+    <>
+      <button className="text-primary text-xs underline" onClick={() => setOpen(true)}>
+        View
+      </button>
+      {open && <CaptureDialog rid={rid} loc={loc} open={open} onClose={() => setOpen(false)} />}
+    </>
+  );
 }

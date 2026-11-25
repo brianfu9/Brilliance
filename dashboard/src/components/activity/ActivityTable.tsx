@@ -282,7 +282,7 @@ export function ActivityTable({
         id: "capture",
         header: "Capture",
         enableSorting: false,
-        cell: () => <CaptureCell />,
+        cell: ({ row }) => <CaptureCell rid={row.original.capture_rid} loc={row.original.capture_loc} />,
       },
       {
         id: "meta",

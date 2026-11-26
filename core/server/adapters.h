@@ -157,6 +157,10 @@ inline SchedMetrics bridge_metrics(const rad::SchedMetrics& m) {
     o.flex_wait_timeouts = m.flex_wait_timeouts;
     o.flex_wait_ms = m.flex_wait_ms;
     o.flex_waiting = m.flex_waiting;
+    o.preempt_resumes = m.preempt_resumes;
+    o.preempt_resume_tokens = m.preempt_resume_tokens;
+    o.preempt_resume_cached = m.preempt_resume_cached;
+    o.preempt_recomputed = m.preempt_recomputed;
     o.admit_kv_held = m.admit_kv_held;
     o.claimants_total = m.claimants_total;
     o.claimant_admitted = m.claimant_admitted;
@@ -344,6 +348,10 @@ public:
             o.queue_pos       = r.queue_pos;
             o.held_s          = r.held_s;
             o.admit_tokens    = r.admit_tokens;
+            o.preempts        = r.preempts;
+            o.preempt_tokens  = r.preempt_tokens;
+            o.resume_cached   = r.resume_cached;
+            o.recomputed      = r.recomputed;
             if (r.queue_pos >= 0) {
                 switch (r.wait_why) {
                     case Scheduler::kWaitKvHold: o.wait = "kv_hold"; break;

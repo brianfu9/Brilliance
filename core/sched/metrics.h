@@ -39,6 +39,12 @@ struct SchedMetrics {
     int64_t flex_wait_timeouts = 0;
     int64_t flex_wait_ms = 0;
     int64_t flex_waiting = 0;
+    /* (local) Re-admissions after a preemption, the tokens those requests had computed when
+     * preempted, how many of them the prefix cache gave back, and how many were computed again. */
+    int64_t preempt_resumes = 0;
+    int64_t preempt_resume_tokens = 0;
+    int64_t preempt_resume_cached = 0;
+    int64_t preempt_recomputed = 0;
     /* --admit-kv-reserve: requests admission held at least once for KV room. */
     int64_t admit_kv_held = 0;
     /* --admit-claimant: claimants first marked (a big waiter crossed its hold window), claimants

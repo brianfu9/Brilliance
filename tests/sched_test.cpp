@@ -2049,6 +2049,55 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
 }
 
+/* (local) A preempted request remembers what it had computed, and its re-admission says how much
+ * of that the prefix cache gave back and how much it computes again: the live request table and
+ * the totals agree, and a request never preempted reports none. */
+TEST(a_resumed_request_reports_what_the_cache_gave_back_after_its_preemption) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+
+    uint64_t a = f.submit(160, 64, /*priority=*/0);
+    uint64_t b = f.submit(160, 64, /*priority=*/5);
+    CHECK(a && b);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);                  /* the pool is full: A is preempted */
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+
+    auto stat = [&](uint64_t id) {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), (int)st.size());
+        for (int i = 0; i < n; ++i) if (st[(size_t)i].id == id) return st[(size_t)i];
+        return Scheduler::ReqStat{};
+    };
+    Scheduler::ReqStat sa = stat(a);
+    CHECK_EQ(sa.preempts, 1);
+    CHECK(sa.preempt_tokens >= 160);                 /* the whole prompt was in the KV */
+    CHECK_EQ(sa.resume_cached, (int64_t)-1);         /* not admitted again yet */
+    CHECK_EQ(sa.recomputed, (int64_t)0);
+    CHECK_EQ(stat(b).preempts, 0);
+
+    /* B leaves; A comes back. */
+    f.commit_plain();
+    f.sch.cancel(b);
+    for (int i = 0; i < 8 && f.sch.find(a)->state != ReqState::Running; ++i) {
+        if (f.sch.step()) f.commit_plain();
+    }
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+
+    sa = stat(a);
+    CHECK_EQ(sa.preempts, 1);
+    CHECK(sa.resume_cached >= 0);
+    CHECK(sa.resume_cached <= sa.preempt_tokens);
+    CHECK_EQ(sa.resume_cached + sa.recomputed, sa.preempt_tokens);
+    const SchedMetrics m = f.sch.metrics();
+    CHECK_EQ(m.preempt_resumes, 1);
+    CHECK_EQ(m.preempt_resume_tokens, sa.preempt_tokens);
+    CHECK_EQ(m.preempt_resume_cached, sa.resume_cached);
+    CHECK_EQ(m.preempt_recomputed, sa.recomputed);
+}
+
 /* A request preempted mid-decode tells its sink, which times it out of the batch until it is
  * re-admitted, so timings can split the decode window into the time it ran and the time it
  * waited. A request never preempted reports none. */

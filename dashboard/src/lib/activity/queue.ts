@@ -12,6 +12,7 @@ export function snapshotOf(model: string, s: Stats | null, receivedAtMs: number)
       prompt: r.prompt, computed: r.computed, cached: r.cached, output: r.output, max: r.max,
       kv_tokens: r.kv_tokens, age_s: r.age_s, ttft_s: r.ttft_s, tps: r.tps, priority: r.priority,
       queue_pos: r.queue_pos, wait: r.wait as QueueRequest["wait"], held_s: r.held_s, admit_tokens: r.admit_tokens,
+      preempts: r.preempts, preempt_tokens: r.preempt_tokens, resume_cached: r.resume_cached, recomputed: r.recomputed,
     }))
   return {
     model, at_ms: s.now_ms, client_received_at_ms: receivedAtMs,

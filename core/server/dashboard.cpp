@@ -453,6 +453,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
                                       { "timeouts", m.flex_wait_timeouts },
                                       { "ms", m.flex_wait_ms },
                                       { "waiting", m.flex_waiting } };
+        /* (local) Re-admissions after preemption: what they had computed, what the prefix
+         * cache gave back, what was computed again. */
+        o["preempt_resume"]       = { { "resumes", m.preempt_resumes },
+                                      { "tokens", m.preempt_resume_tokens },
+                                      { "cached", m.preempt_resume_cached },
+                                      { "recomputed", m.preempt_recomputed } };
         o["prefix_hit_rate"] = m.prefix_hit_rate;
         /* Leading indicator beside the lagging hit rate: past ~75% kv utilisation the cache
          * starts dropping prefixes the next turn wants. */
@@ -539,6 +545,13 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             if (q.queue_pos >= 0) { j["queue_pos"] = q.queue_pos; j["wait"] = q.wait; }
             if (q.held_s >= 0) j["held_s"] = q.held_s;
             if (q.admit_tokens > 0) j["admit_tokens"] = q.admit_tokens;
+            /* (local) Only for a request that was preempted. */
+            if (q.preempts > 0) {
+                j["preempts"]       = q.preempts;
+                j["preempt_tokens"] = q.preempt_tokens;
+                if (q.resume_cached >= 0) j["resume_cached"] = q.resume_cached;
+                j["recomputed"]     = q.recomputed;
+            }
             reqs.push_back(std::move(j));
         }
         o["requests"] = std::move(reqs);

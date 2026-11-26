@@ -57,6 +57,9 @@ export interface RunningRequest {
   ctx: number; kv_tokens: number; priority: number
   // Emitted only while they apply (dashboard.cpp): a tag given, a place in the queue, a hold, an admission need.
   ttft_s?: number; prefill_s?: number; tag?: string; queue_pos?: number; wait?: string; held_s?: number; admit_tokens?: number
+  // (local) Only on a request that was preempted: times, tokens computed when last preempted, of those
+  // taken back from the prefix cache on re-admission (absent until then), tokens computed again in all.
+  preempts?: number; preempt_tokens?: number; resume_cached?: number; recomputed?: number
 }
 export interface DraftPosition { reached: number; rate: number }
 export interface ExpertTier { name: string; units: number; bytes: number }

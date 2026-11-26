@@ -124,6 +124,8 @@ private:
     Counter c_flex_granted_, c_flex_refused_zero_, c_flex_refused_short_;
     Counter c_flex_waits_, c_flex_wait_timeouts_, c_flex_wait_ms_;
     Gauge   g_flex_waiting_;
+    Counter c_preempt_resumes_, c_preempt_resume_tokens_, c_preempt_resume_cached_,
+            c_preempt_recomputed_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
     /* The decode floor in seconds: the fastest and the most recent single-sequence window. 0
      * until a window completes, and render() omits a 0. */

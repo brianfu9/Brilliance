@@ -238,6 +238,10 @@ void Metrics::sample(const SchedMetrics& m) {
     c_flex_wait_timeouts_.advance_to((double)m.flex_wait_timeouts);
     c_flex_wait_ms_.advance_to((double)m.flex_wait_ms);
     g_flex_waiting_.set((double)m.flex_waiting);
+    c_preempt_resumes_.advance_to((double)m.preempt_resumes);
+    c_preempt_resume_tokens_.advance_to((double)m.preempt_resume_tokens);
+    c_preempt_resume_cached_.advance_to((double)m.preempt_resume_cached);
+    c_preempt_recomputed_.advance_to((double)m.preempt_recomputed);
     c_kv_stream_bytes_.advance_to((double)m.kv_stream_bytes_in);
     g_linear_hit_.set(m.linear_hit_rate);
 }
@@ -351,6 +355,17 @@ std::string Metrics::render() const {
               L, c_flex_wait_ms_.get());
     w.gauge("radiance:flex_waiting",
             "Running requests held for the fleet now (local).", L, g_flex_waiting_.get());
+    w.counter("radiance:preempt_resumes_total",
+              "Re-admissions of preempted requests (local).", L, c_preempt_resumes_.get());
+    w.counter("radiance:preempt_resume_tokens_total",
+              "Tokens preempted requests had computed when preempted (local).",
+              L, c_preempt_resume_tokens_.get());
+    w.counter("radiance:preempt_resume_cached_tokens_total",
+              "Of those, tokens the prefix cache gave back on re-admission (local).",
+              L, c_preempt_resume_cached_.get());
+    w.counter("radiance:preempt_recomputed_tokens_total",
+              "Of those, tokens computed again after a preemption (local).",
+              L, c_preempt_recomputed_.get());
     /* Labelled by direction; the resolve only copies in. */
     w.help("radiance:kv_stream_bytes_total",
            "Bytes a streamed KV group's resolve moved, by direction.", "counter");

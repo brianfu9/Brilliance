@@ -632,7 +632,7 @@ radiance sets the first five before the runtime starts, only where they are unse
 | `RADIANCE_DS41_EXPERT_SPLIT` | DeepSeek 4.1's own older name for `RADIANCE_EXPERT_SPLIT` (each count even), read when that is unset | an even split | comma-separated even counts | developer | `arch/deepseek41/deepseek41.cpp:701` |
 | `RADIANCE_MEDIA_OUT` | folder where finished generated images (`images/`) and videos (`videos/`) are saved with a shared zero-padded index (`.index`) | unset (disabled) | folder path | operator | `core/engine.cpp:4038` |
 | `RADIANCE_HISTORY_DIR` | folder where finished request logs (`<model>.jsonl`) and fleet off-switch state (`fleet-off.json`) are kept across restarts | unset (in-memory only) | folder path | operator | `core/fleet/fleet.cpp:3122` |
-| `RADIANCE_DASHBOARD_PAGE` | built HTML file (`dist/index.html`) served in place of the compiled-in dashboard page, re-read on each load | unset (compiled-in page) | file path | operator | `core/server/dashboard.cpp:689` |
+| `RADIANCE_DASHBOARD_PAGE` | built HTML file (`dist/index.html`) served in place of the compiled-in dashboard page, re-read on each load | unset (compiled-in page) | file path | operator | `core/server/dashboard.cpp:702` |
 
 ### Calibration (for converting models)
 
@@ -659,7 +659,7 @@ Each slows the engine or writes large files. Never on a server people use.
 | `RADIANCE_DEBUG_CKPT_HASH` | `1` hashes each rank's checkpoint snapshots, to compare builds; drains the streams | off | `1` | developer | `core/engine.cpp:2311` |
 | `RADIANCE_DEBUG_CONC_LOG` | writes the adaptive draft depth's online log to this file | unset | file | developer | `core/engine_draft.cpp:211` |
 | `RADIANCE_DEBUG_DS41_DUMP` | writes DeepSeek-V4.1's per-layer trace of every prefill step into this folder: each layer's input streams, each rank's attention partial and the reduced output, the MoE input, the router scores, the selected experts and their weights, the MoE output, then the final rows and each rank's head logits (`s<step>.t<rows>.l<layer>.<site>.r<rank>.<dtype>`). Synchronises the stream at every site; a recorded (replayed) pass writes nothing. **Safety:** diagnostics only; slow, and the folder grows by about 2 MB a layer a rank for a 30-row step. | unset (off) | folder | developer | `arch/deepseek41/deepseek41.cpp:1490` |
-| `RADIANCE_DEBUG_DRAFT` | counts why draft rounds were or were not scheduled | off | not `0` | developer | `core/sched/scheduler.cpp:4306` |
+| `RADIANCE_DEBUG_DRAFT` | counts why draft rounds were or were not scheduled | off | not `0` | developer | `core/sched/scheduler.cpp:4333` |
 | `RADIANCE_DEBUG_ISSUE` | times weight-table refreshes in the issue path | off | set | developer | `core/runtime/issue.cpp:343` |
 | `RADIANCE_DEBUG_JINJA` | traces every statement of every chat-template render (very verbose) | off | not `0` | developer | `core/text/chat.cpp:63` |
 | `RADIANCE_DEBUG_MM_DUMP` | writes each image's patches and encoder rows as raw bf16 into this folder | unset | folder | developer | `core/engine_mm.cpp:37` |

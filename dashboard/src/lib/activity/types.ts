@@ -176,6 +176,13 @@ export interface QueueRequest {
   wait?: "queued" | "kv_hold" | "kv_room" | "behind" | "media";
   held_s?: number;
   admit_tokens?: number;
+  /** Only on a preempted request: times preempted, tokens it had computed when last preempted,
+   * of those taken back from the prefix cache on re-admission (absent until then), and the tokens
+   * all its re-admissions computed again. */
+  preempts?: number;
+  preempt_tokens?: number;
+  resume_cached?: number;
+  recomputed?: number;
 }
 
 export interface QueuePolicy {

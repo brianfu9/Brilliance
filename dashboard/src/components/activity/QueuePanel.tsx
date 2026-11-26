@@ -26,6 +26,7 @@ import {
   requestKey,
   runningRequests,
   waitReason,
+  resumeSummary,
   waitingRequests,
 } from "@/lib/activity/queueView";
 import { useColumns } from "@/lib/activity/columns";
@@ -602,12 +603,18 @@ function TokenQueueSection({
             <span className="font-mono">#{r.id}</span>
           </span>
         );
-      case "state":
-        if (prefill) {
-          const done = r.prompt > 0 ? r.computed / r.prompt : 0;
-          return `prefill ${(done * 100).toFixed(0)}%`;
-        }
-        return "decode";
+      case "state": {
+        const done = r.prompt > 0 ? r.computed / r.prompt : 0;
+        const base = prefill ? `prefill ${(done * 100).toFixed(0)}%` : "decode";
+        const resumed = resumeSummary(r);
+        if (!resumed) return base;
+        return (
+          <span className="inline-flex flex-wrap items-baseline gap-x-2" title={resumed.title}>
+            {base}
+            <span className="text-xs text-muted-foreground">{resumed.text}</span>
+          </span>
+        );
+      }
       case "cached_context":
         return (
           <>

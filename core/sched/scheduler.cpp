@@ -486,6 +486,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
     s.preempted_us = 0;
+    s.preempts = 0;
+    s.preempt_tokens = 0;
+    s.resume_cached = -1;
+    s.recomputed = 0;
     /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
      * whenever it is non-zero: left standing, it would date this request's first token to the
      * admission of whichever request held the slot before. The re-admission guard below needs
@@ -1113,6 +1117,10 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
         o.priority        = r.priority;
         o.held_s          = s.held_us ? (double)(now - s.held_us) / 1e6 : -1.0;
         o.wait_why        = s.wait_why;
+        o.preempts        = s.preempts;
+        o.preempt_tokens  = s.preempt_tokens;
+        o.resume_cached   = s.resume_cached;
+        o.recomputed      = s.recomputed;
         o.queue_pos       = -1;
         for (size_t k = 0; k < waiting_.size(); ++k)
             if (waiting_[k] == s.slot) { o.queue_pos = (int32_t)k; break; }
@@ -1581,6 +1589,10 @@ bool Scheduler::preempt_back() {
      * is published first: the recompute adopts it from the cache, and under pressure the cache gives
      * the blocks back (the newest entries last). */
     const bool published = publish_prefix(s);
+    /* (local) What it had computed, so the re-admission can say how much the cache gave back. */
+    ++s.preempts;
+    s.preempt_tokens = r.n_computed;
+    s.resume_cached = -1;
     kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -1961,6 +1973,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
     if (!s.admitted_us) s.admitted_us = mono_us();   /* first admission; a re-admit after
                                                      * preemption keeps the original stamp */
     s.preempted_us = 0;
+    /* (local) The first admission after a preemption: how much of what it had computed came back
+     * from the prefix cache, and how much it must compute again. */
+    if (s.preempts > 0 && s.resume_cached < 0) {
+        s.resume_cached = std::min<int64_t>(r.n_cached, s.preempt_tokens);
+        const int64_t again = s.preempt_tokens - s.resume_cached;
+        s.recomputed += again;
+        ++m_.preempt_resumes;
+        m_.preempt_resume_tokens += s.preempt_tokens;
+        m_.preempt_resume_cached += s.resume_cached;
+        m_.preempt_recomputed += again;
+        RAD_INFO("request %llu resumes after preemption: %lld of the %lld tokens it had computed "
+                 "come from the prefix cache, %lld are computed again",
+                 (unsigned long long)r.id, (long long)s.resume_cached,
+                 (long long)s.preempt_tokens, (long long)again);
+    }
     s.running = true;
     server::sink_admitted(r.sink);
     server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);

@@ -111,16 +111,44 @@ export function waitReason(
     case "behind":
       return { label: "Behind", detail: "held request ahead", tone: "blocked" };
     case "kv_room":
-      return {
-        label: r.state === "preempted" ? "Preempted" : "KV room",
-        detail: "recomputes its context",
-        tone: "blocked",
-      };
+      return r.state === "preempted"
+        ? { label: "Preempted", detail: preemptedDetail(r), tone: "blocked" }
+        : { label: "KV room", detail: "waits for KV space", tone: "blocked" };
     case "media":
       return { label: "Encoding", detail: "", tone: "info" };
     default:
       return { label: "Next step", detail: "", tone: "pending" };
   }
+}
+
+// A preempted request still waiting: what it had computed. The prefix cache gives most of that
+// back on re-admission (resumeSummary says how much); older servers send no figures.
+export function preemptedDetail(r: QueueRequest): string {
+  const parts: string[] = [];
+  if (r.preempt_tokens !== undefined && r.preempt_tokens > 0) {
+    parts.push(`had ${formatTokens(r.preempt_tokens)} computed`);
+  }
+  if ((r.preempts ?? 0) > 1) parts.push(`preempted ${r.preempts}×`);
+  if ((r.recomputed ?? 0) > 0) parts.push(`${formatTokens(r.recomputed ?? 0)} recomputed so far`);
+  return parts.length > 0 ? parts.join(" · ") : "resumes from the prefix cache";
+}
+
+// A request running again after a preemption: how much of what it had computed came back from the
+// prefix cache and how much it computed again; null when it was never preempted or the server
+// sends no figures.
+export function resumeSummary(r: QueueRequest): { text: string; title: string } | null {
+  if ((r.preempts ?? 0) <= 0 || r.resume_cached === undefined || r.preempt_tokens === undefined) {
+    return null;
+  }
+  const again = r.recomputed ?? 0;
+  const n = r.preempts ?? 0;
+  return {
+    text: `resumed: ${formatTokens(r.resume_cached)} cached · ${formatTokens(again)} again`,
+    title:
+      `preempted ${n === 1 ? "once" : `${n} times`}; when last preempted it had ` +
+      `${formatTokens(r.preempt_tokens)} computed, and the prefix cache gave back ` +
+      `${formatTokens(r.resume_cached)}. Computed again after preemption in all: ${formatTokens(again)}.`,
+  };
 }
 
 export function formatTokens(n: number): string {

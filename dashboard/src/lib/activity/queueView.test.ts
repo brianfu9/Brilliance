@@ -11,6 +11,7 @@ import {
   outputRoom,
   runningRequests,
   waitReason,
+  resumeSummary,
   waitingRequests,
 } from "./queueView";
 
@@ -95,6 +96,26 @@ describe("queue order and reasons", () => {
       detail: "held request ahead",
       tone: "blocked",
     });
+  });
+
+  it("says what a preempted request had computed, and that a KV-room wait recomputes nothing", () => {
+    const pre = req({ id: 7, state: "preempted", queue_pos: 0, wait: "kv_room", preempts: 1, preempt_tokens: 120_000 });
+    expect(waitReason(pre, l, 60000)).toEqual({ label: "Preempted", detail: "had 120k computed", tone: "blocked" });
+    const twice = req({ ...pre, preempts: 2, recomputed: 1500 });
+    expect(waitReason(twice, l, 60000).detail).toBe("had 120k computed · preempted 2× · 1.5k recomputed so far");
+    // An older server sends no figures.
+    expect(waitReason(req({ id: 8, state: "preempted", queue_pos: 0, wait: "kv_room" }), l, 60000).detail)
+      .toBe("resumes from the prefix cache");
+    expect(waitReason(req({ id: 9, state: "waiting", queue_pos: 0, wait: "kv_room" }), l, 60000))
+      .toEqual({ label: "KV room", detail: "waits for KV space", tone: "blocked" });
+  });
+
+  it("sums up a resumed request: what the cache gave back and what was computed again", () => {
+    expect(resumeSummary(req({ id: 3 }))).toBeNull();
+    expect(resumeSummary(req({ id: 3, preempts: 1, preempt_tokens: 120_000 }))).toBeNull(); // not re-admitted yet
+    const r = resumeSummary(req({ id: 3, preempts: 1, preempt_tokens: 120_000, resume_cached: 118_000, recomputed: 2000 }))!;
+    expect(r.text).toBe("resumed: 118k cached · 2.0k again");
+    expect(r.title).toContain("preempted once");
   });
 
 });

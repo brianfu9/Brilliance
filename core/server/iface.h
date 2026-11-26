@@ -147,6 +147,11 @@ struct SchedMetrics {
     int64_t flex_wait_timeouts = 0;
     int64_t flex_wait_ms = 0;
     int64_t flex_waiting = 0;
+    /* (local) Re-admissions after preemption: count, tokens held before, from cache, again. */
+    int64_t preempt_resumes = 0;
+    int64_t preempt_resume_tokens = 0;
+    int64_t preempt_resume_cached = 0;
+    int64_t preempt_recomputed = 0;
     int64_t admit_kv_held = 0;        /* --admit-kv-reserve: requests held for KV room */
     /* --admit-claimant: claimants stamped and admitted, fillers refused by the anchor gate. */
     int64_t claimants_total = 0;
@@ -256,6 +261,13 @@ struct RequestStat {
     double      held_s = -1;
     std::string wait;
     int64_t     admit_tokens = 0;
+    /* (local) Scheduler::ReqStat's preemption cost: times preempted, tokens computed when last
+     * preempted, of those taken back from the cache on re-admission (-1 until then), and tokens
+     * all re-admissions computed again. */
+    int32_t     preempts = 0;
+    int64_t     preempt_tokens = 0;
+    int64_t     resume_cached = -1;
+    int64_t     recomputed = 0;
 };
 
 class IScheduler {

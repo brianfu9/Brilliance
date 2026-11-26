@@ -48,6 +48,11 @@ struct StatsScheduler : FakeScheduler {
         r.wait = "kv_hold";
         r.held_s = 1.5;
         r.admit_tokens = 2048;
+        /* (local) A preemption's cost, emitted only for a request that was preempted. */
+        r.preempts = 1;
+        r.preempt_tokens = 900;
+        r.resume_cached = 896;
+        r.recomputed = 4;
         out->assign(1, r);
         return 1;
     }

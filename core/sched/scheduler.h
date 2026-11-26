@@ -54,6 +54,14 @@ struct SchedReq {
     /* (local) --flex-wait-ms: when this running request's KV growth began waiting on the fleet;
      * 0 when it is not waiting. */
     int64_t  flex_wait_us = 0;
+    /* (local) What preemption cost this request, for the live request table: how many times it
+     * was preempted, the tokens it had computed when last preempted, how many of those the
+     * re-admission took back from the prefix cache (-1 until it is admitted again), and the
+     * tokens all its re-admissions had to compute again. */
+    int32_t  preempts = 0;
+    int64_t  preempt_tokens = 0;
+    int64_t  resume_cached = -1;
+    int64_t  recomputed = 0;
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
     int64_t  held_us = 0;        /* when admission first held it for KV room (--admit-kv-reserve);
@@ -339,6 +347,11 @@ public:
         /* The full-attention tokens --admit-kv-reserve counts for it: held or needed context plus
          * its output reserve, in whole blocks. 0 with the gate off. */
         int64_t  admit_tokens = 0;
+        /* (local) SchedReq::preempts, preempt_tokens, resume_cached, recomputed. */
+        int32_t  preempts = 0;
+        int64_t  preempt_tokens = 0;
+        int64_t  resume_cached = -1;
+        int64_t  recomputed = 0;
     };
     /* Why a waiting request was not admitted by the last walk. */
     enum WaitWhy : uint8_t {
